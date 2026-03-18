@@ -11,7 +11,7 @@ use axum::{
     extract::State,
     http::header,
     middleware,
-    response::IntoResponse,
+    response::{Html, IntoResponse},
     routing::{get, post},
     Router,
 };
@@ -28,17 +28,24 @@ pub struct AppState {
     pub graph: Option<Arc<graph_service::GraphService>>,
     pub photos_dir: std::path::PathBuf,
     pub password_hash: Option<String>,
+    pub admin_password_hash: Option<String>,
 }
 
+/// User role, injected into request extensions by auth middleware.
+#[derive(Clone, Debug)]
+pub struct UserRole(pub String); // "admin" or "user"
+
 /// Auth middleware — redirects to /login if no valid session cookie.
-/// Passes through if no password is configured (backward compat).
+/// Injects UserRole into request extensions for downstream handlers.
+/// Admin routes (/admin/*) require "admin" role.
 async fn require_auth(
     State(state): State<Arc<AppState>>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: middleware::Next,
 ) -> axum::response::Response {
-    // If no password configured, pass through (backward compat)
+    // If no password configured, pass through as admin (backward compat)
     if state.password_hash.is_none() {
+        request.extensions_mut().insert(UserRole("admin".to_string()));
         return next.run(request).await;
     }
 
@@ -50,16 +57,25 @@ async fn require_auth(
         || path.starts_with("/badge/")
         || path == "/photos/logo.png"
     {
+        request.extensions_mut().insert(UserRole("user".to_string()));
         return next.run(request).await;
     }
 
-    // Extract session cookie
+    // Extract session cookie and validate
     if let Some(cookie_header) = request.headers().get("cookie") {
         if let Ok(cookies) = cookie_header.to_str() {
             for cookie in cookies.split(';') {
                 let cookie = cookie.trim();
                 if let Some(token) = cookie.strip_prefix("gk_session=") {
-                    if db::validate_session(&state.db, token) {
+                    if let Some(role) = db::validate_session(&state.db, token) {
+                        // Admin routes require admin role
+                        if path.starts_with("/admin") && role != "admin" {
+                            return (
+                                axum::http::StatusCode::FORBIDDEN,
+                                Html("<h2>Access Denied</h2><p>Admin privileges required.</p><a href=\"/\">Back to Dashboard</a>"),
+                            ).into_response();
+                        }
+                        request.extensions_mut().insert(UserRole(role));
                         return next.run(request).await;
                     }
                 }
@@ -94,20 +110,37 @@ async fn main() {
     // Seed some demo hosts if the table is empty
     seed_demo_data(&pool);
 
-    // Admin password — hash from env var
+    // Password hashing helper
+    let hash_password = |pw: &str| -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(pw.as_bytes()))
+    };
+
+    // Front desk password
     let password_hash = match std::env::var("GATEKEEPER_PASSWORD") {
         Ok(pw) if !pw.is_empty() => {
-            use sha2::Digest;
-            let hash = sha2::Sha256::digest(pw.as_bytes());
-            let hex_hash = hex::encode(hash);
-            tracing::info!("Admin authentication enabled");
-            Some(hex_hash)
+            tracing::info!("Front desk authentication enabled");
+            Some(hash_password(&pw))
         }
         _ => {
             tracing::warn!(
-                "GATEKEEPER_PASSWORD not set — admin panel is unprotected! \
+                "GATEKEEPER_PASSWORD not set — app is unprotected! \
                  Set this env var to enable login."
             );
+            None
+        }
+    };
+
+    // Admin password (falls back to front desk password if not set)
+    let admin_password_hash = match std::env::var("GATEKEEPER_ADMIN_PASSWORD") {
+        Ok(pw) if !pw.is_empty() => {
+            tracing::info!("Admin authentication enabled (separate admin password)");
+            Some(hash_password(&pw))
+        }
+        _ => {
+            if password_hash.is_some() {
+                tracing::info!("GATEKEEPER_ADMIN_PASSWORD not set — front desk password also grants admin access");
+            }
             None
         }
     };
@@ -131,7 +164,7 @@ async fn main() {
     );
     std::fs::create_dir_all(&photos_dir).expect("Failed to create photos directory");
 
-    let state = Arc::new(AppState { db: pool, graph, photos_dir, password_hash });
+    let state = Arc::new(AppState { db: pool, graph, photos_dir, password_hash, admin_password_hash });
 
     // Background cleanup task (photos + expired sessions)
     {

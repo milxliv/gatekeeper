@@ -33,30 +33,45 @@ pub async fn api_login(
     State(state): State<Arc<AppState>>,
     Form(form): Form<LoginForm>,
 ) -> impl IntoResponse {
-    let expected = match &state.password_hash {
-        Some(h) => h,
-        None => {
-            return axum::response::Redirect::to("/").into_response();
-        }
-    };
+    if state.password_hash.is_none() {
+        return axum::response::Redirect::to("/").into_response();
+    }
 
     use sha2::Digest;
     let submitted_hash = hex::encode(sha2::Sha256::digest(form.password.as_bytes()));
 
-    if submitted_hash == *expected {
-        // Create session
-        let token = uuid::Uuid::new_v4().to_string();
-        let _ = db::create_session(&state.db, &token, 24);
-        let cookie = format!(
-            "gk_session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400",
-            token
-        );
-        (
-            [(axum::http::header::SET_COOKIE, cookie)],
-            axum::response::Redirect::to("/"),
-        ).into_response()
+    // Check admin password first, then front desk password
+    let role = if let Some(ref admin_hash) = state.admin_password_hash {
+        if submitted_hash == *admin_hash {
+            Some("admin")
+        } else if state.password_hash.as_deref() == Some(&submitted_hash) {
+            Some("user")
+        } else {
+            None
+        }
+    } else if state.password_hash.as_deref() == Some(&submitted_hash) {
+        // No separate admin password — front desk password grants admin
+        Some("admin")
     } else {
-        Html(templates::login_page(Some("Invalid password."))).into_response()
+        None
+    };
+
+    match role {
+        Some(role) => {
+            let token = uuid::Uuid::new_v4().to_string();
+            let _ = db::create_session(&state.db, &token, role, 24);
+            let cookie = format!(
+                "gk_session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400",
+                token
+            );
+            (
+                [(axum::http::header::SET_COOKIE, cookie)],
+                axum::response::Redirect::to("/"),
+            ).into_response()
+        }
+        None => {
+            Html(templates::login_page(Some("Invalid password."))).into_response()
+        }
     }
 }
 
@@ -82,7 +97,7 @@ pub async fn api_logout(
     )
 }
 
-// ── Theme helper ──────────────────────────────────────────────
+// ── Theme & role helpers ──────────────────────────────────────
 
 fn apply_theme(state: &AppState) {
     let theme = db::get_setting(&state.db, "ui_theme")
@@ -90,10 +105,25 @@ fn apply_theme(state: &AppState) {
     templates::set_theme(&theme);
 }
 
+fn apply_role(role: &crate::UserRole) {
+    templates::set_role(&role.0);
+}
+
+/// Extract the UserRole from request extensions
+fn extract_role(extensions: &axum::http::Extensions) -> crate::UserRole {
+    extensions.get::<crate::UserRole>()
+        .cloned()
+        .unwrap_or(crate::UserRole("admin".to_string()))
+}
+
 // ── Page routes ───────────────────────────────────────────────
 
-pub async fn page_dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
+pub async fn page_dashboard(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(role): axum::Extension<crate::UserRole>,
+) -> Html<String> {
     apply_theme(&state);
+    apply_role(&role);
     let visits = db::list_visits_today(&state.db).unwrap_or_default();
     let upcoming = db::list_preregistered_upcoming(&state.db).unwrap_or_default();
     Html(templates::dashboard_page(&visits, &upcoming))
@@ -101,8 +131,10 @@ pub async fn page_dashboard(State(state): State<Arc<AppState>>) -> Html<String> 
 
 pub async fn page_pre_register(
     State(state): State<Arc<AppState>>,
+    axum::Extension(role): axum::Extension<crate::UserRole>,
 ) -> Html<String> {
     apply_theme(&state);
+    apply_role(&role);
     let hosts = db::list_hosts(&state.db).unwrap_or_default();
     let purposes = db::get_setting(&state.db, "purpose_list")
         .unwrap_or_else(|| "Meeting,Sales Call,Interview,Vendor / Install,Tour,Delivery".to_string());
@@ -113,8 +145,12 @@ pub async fn page_pre_register(
     Html(templates::pre_register_page(&hosts, &purposes, &areas, &visitor_types))
 }
 
-pub async fn page_walk_in(State(state): State<Arc<AppState>>) -> Html<String> {
+pub async fn page_walk_in(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(role): axum::Extension<crate::UserRole>,
+) -> Html<String> {
     apply_theme(&state);
+    apply_role(&role);
     let hosts = db::list_hosts(&state.db).unwrap_or_default();
     let areas = db::get_setting(&state.db, "area_list")
         .unwrap_or_else(|| "Studios,Master Control,Rack Room,Transmitter,Newsroom,Offices,Multiple Areas".to_string());
@@ -123,14 +159,22 @@ pub async fn page_walk_in(State(state): State<Arc<AppState>>) -> Html<String> {
     Html(templates::walk_in_page(&hosts, &areas, &visitor_types))
 }
 
-pub async fn page_hosts(State(state): State<Arc<AppState>>) -> Html<String> {
+pub async fn page_hosts(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(role): axum::Extension<crate::UserRole>,
+) -> Html<String> {
     apply_theme(&state);
+    apply_role(&role);
     let hosts = db::list_hosts(&state.db).unwrap_or_default();
     Html(templates::hosts_page(&hosts))
 }
 
-pub async fn page_log(State(state): State<Arc<AppState>>) -> Html<String> {
+pub async fn page_log(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(role): axum::Extension<crate::UserRole>,
+) -> Html<String> {
     apply_theme(&state);
+    apply_role(&role);
     let visits = db::search_visits(&state.db, "", None, None).unwrap_or_default();
     Html(templates::log_page(&visits))
 }
@@ -732,8 +776,12 @@ pub async fn api_kiosk_checkin(
 
 // ── Admin panel ───────────────────────────────────────────────
 
-pub async fn page_admin(State(state): State<Arc<AppState>>) -> Html<String> {
+pub async fn page_admin(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(role): axum::Extension<crate::UserRole>,
+) -> Html<String> {
     apply_theme(&state);
+    apply_role(&role);
     let settings = db::get_all_settings(&state.db);
     let hosts = db::list_hosts(&state.db).unwrap_or_default();
     let stats = db::get_db_stats(&state.db);

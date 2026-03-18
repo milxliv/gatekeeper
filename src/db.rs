@@ -94,14 +94,18 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         [],
     );
 
-    // Sessions table for admin auth
+    // Sessions table for auth
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS sessions (
             token       TEXT PRIMARY KEY,
+            role        TEXT NOT NULL DEFAULT 'user',
             created_at  TEXT NOT NULL DEFAULT (datetime('now')),
             expires_at  TEXT NOT NULL
         );"
     )?;
+
+    // Migration: add role column if missing (for existing V2 databases)
+    let _ = conn.execute("ALTER TABLE sessions ADD COLUMN role TEXT NOT NULL DEFAULT 'user'", []);
 
     // V2: Remove graph secrets from settings (now env-var only)
     let _ = conn.execute_batch(
@@ -161,14 +165,15 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
 // ── Session queries ──────────────────────────────────────────
 
-pub fn create_session(db: &DbPool, token: &str, expires_hours: i64) -> Result<()> {
+pub fn create_session(db: &DbPool, token: &str, role: &str, expires_hours: i64) -> Result<()> {
     let conn = db.lock().unwrap();
     let now = chrono::Local::now();
     let expires = now + chrono::Duration::hours(expires_hours);
     conn.execute(
-        "INSERT INTO sessions (token, created_at, expires_at) VALUES (?1, ?2, ?3)",
+        "INSERT INTO sessions (token, role, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
         params![
             token,
+            role,
             now.format("%Y-%m-%d %H:%M:%S").to_string(),
             expires.format("%Y-%m-%d %H:%M:%S").to_string(),
         ],
@@ -176,14 +181,15 @@ pub fn create_session(db: &DbPool, token: &str, expires_hours: i64) -> Result<()
     Ok(())
 }
 
-pub fn validate_session(db: &DbPool, token: &str) -> bool {
+/// Returns the role ("admin" or "user") if the session is valid, None otherwise.
+pub fn validate_session(db: &DbPool, token: &str) -> Option<String> {
     let conn = db.lock().unwrap();
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     conn.query_row(
-        "SELECT 1 FROM sessions WHERE token = ?1 AND expires_at > ?2",
+        "SELECT role FROM sessions WHERE token = ?1 AND expires_at > ?2",
         params![token, now],
-        |_| Ok(()),
-    ).is_ok()
+        |row| row.get::<_, String>(0),
+    ).ok()
 }
 
 pub fn delete_session(db: &DbPool, token: &str) {

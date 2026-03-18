@@ -55,6 +55,7 @@ body {{
 
 thread_local! {
     static CURRENT_THEME: RefCell<String> = RefCell::new("system".to_string());
+    static CURRENT_ROLE: RefCell<String> = RefCell::new("admin".to_string());
 }
 
 /// Set the theme for the current request (call before rendering)
@@ -62,8 +63,17 @@ pub fn set_theme(theme: &str) {
     CURRENT_THEME.with(|t| *t.borrow_mut() = theme.to_string());
 }
 
+/// Set the user role for the current request
+pub fn set_role(role: &str) {
+    CURRENT_ROLE.with(|r| *r.borrow_mut() = role.to_string());
+}
+
 fn get_theme() -> String {
     CURRENT_THEME.with(|t| t.borrow().clone())
+}
+
+fn is_admin() -> bool {
+    CURRENT_ROLE.with(|r| r.borrow().as_str() == "admin")
 }
 
 /// Wraps content in the base layout shell
@@ -296,15 +306,7 @@ pub fn layout_with_theme(title: &str, content: &str, theme: &str) -> String {
             <h1>⛊ GateKeeper</h1>
             <div class="subtitle">WBBH Visitor Management</div>
             <nav>
-                <a href="/" class="active">Dashboard</a>
-                <a href="/pre-register">Pre-Register Visitor</a>
-                <a href="/walk-in">Walk-In Check-In</a>
-                <a href="/hosts">Manage Hosts</a>
-                <a href="/log">Visitor Log</a>
-                <a href="/admin" style="margin-top:1rem;border-top:1px solid var(--border);padding-top:0.75rem;">Admin Panel</a>
-                <form method="POST" action="/logout" style="margin-top:auto;padding-top:1rem;">
-                    <button type="submit" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:0.85rem;padding:0.25rem 0;">Logout</button>
-                </form>
+                {sidebar_nav}
             </nav>
         </aside>
         <main class="main">
@@ -601,13 +603,33 @@ pub fn layout_with_theme(title: &str, content: &str, theme: &str) -> String {
     }}
     </script>
 </body>
-</html>"##, title = title, content = content, theme_attr = theme_attr)
+</html>"##, title = title, content = content, theme_attr = theme_attr, sidebar_nav = sidebar_nav())
 }
 
-/// Wrapper that uses the current thread-local theme
+/// Wrapper that uses the current thread-local theme and role
 pub fn layout(title: &str, content: &str) -> String {
     let theme = get_theme();
     layout_with_theme(title, content, &theme)
+}
+
+/// Build sidebar nav based on user role
+fn sidebar_nav() -> String {
+    let admin_only = if is_admin() {
+        r#"<a href="/admin" style="margin-top:1rem;border-top:1px solid var(--border);padding-top:0.75rem;">Admin Panel</a>"#
+    } else {
+        ""
+    };
+    format!(r#"
+        <a href="/" class="active">Dashboard</a>
+        <a href="/pre-register">Pre-Register Visitor</a>
+        <a href="/walk-in">Walk-In Check-In</a>
+        <a href="/hosts">Manage Hosts</a>
+        <a href="/log">Visitor Log</a>
+        {admin_only}
+        <form method="POST" action="/logout" style="margin-top:auto;padding-top:1rem;">
+            <button type="submit" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:0.85rem;padding:0.25rem 0;">Logout</button>
+        </form>
+    "#)
 }
 
 /// Dashboard page — today's visits + stats
