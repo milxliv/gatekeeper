@@ -1,6 +1,58 @@
 use crate::models::*;
 use std::cell::RefCell;
 
+/// Login page — standalone, no sidebar
+pub fn login_page(error: Option<&str>) -> String {
+    let error_html = match error {
+        Some(msg) => format!(r#"<div style="color:#dc2626;background:#fee2e2;padding:0.75rem;border-radius:6px;margin-bottom:1rem;font-size:0.9rem;">{}</div>"#, msg),
+        None => String::new(),
+    };
+
+    format!(r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>GateKeeper — Login</title>
+<style>
+* {{ margin:0; padding:0; box-sizing:border-box; }}
+body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: #f3f4f6; display:flex; justify-content:center; align-items:center;
+    min-height:100vh;
+}}
+.login-card {{
+    background: #fff; border-radius: 12px; padding: 2.5rem;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.1); width: 100%; max-width: 380px;
+}}
+.login-card h1 {{ font-size:1.5rem; margin-bottom:0.25rem; }}
+.login-card .sub {{ color:#666; font-size:0.9rem; margin-bottom:1.5rem; }}
+.login-card label {{ display:block; font-weight:600; margin-bottom:0.4rem; font-size:0.9rem; }}
+.login-card input[type="password"] {{
+    width:100%; padding:0.75rem; border:1px solid #d1d5db; border-radius:6px;
+    font-size:1rem; margin-bottom:1rem;
+}}
+.login-card button {{
+    width:100%; padding:0.75rem; background:#1a56db; color:#fff; border:none;
+    border-radius:6px; font-size:1rem; font-weight:600; cursor:pointer;
+}}
+.login-card button:hover {{ background:#1e40af; }}
+</style>
+</head>
+<body>
+<div class="login-card">
+    <h1>GateKeeper</h1>
+    <p class="sub">Visitor Management System</p>
+    {error}
+    <form method="POST" action="/login">
+        <label for="password">Password</label>
+        <input type="password" name="password" id="password" placeholder="Enter admin password" autofocus required>
+        <button type="submit">Sign In</button>
+    </form>
+</div>
+</body>
+</html>"#, error = error_html)
+}
+
 thread_local! {
     static CURRENT_THEME: RefCell<String> = RefCell::new("system".to_string());
 }
@@ -250,6 +302,9 @@ pub fn layout_with_theme(title: &str, content: &str, theme: &str) -> String {
                 <a href="/hosts">Manage Hosts</a>
                 <a href="/log">Visitor Log</a>
                 <a href="/admin" style="margin-top:1rem;border-top:1px solid var(--border);padding-top:0.75rem;">Admin Panel</a>
+                <form method="POST" action="/logout" style="margin-top:auto;padding-top:1rem;">
+                    <button type="submit" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:0.85rem;padding:0.25rem 0;">Logout</button>
+                </form>
             </nav>
         </aside>
         <main class="main">
@@ -1454,16 +1509,6 @@ pub fn admin_page(
             .unwrap_or_default()
     };
 
-    // Mask the client secret for display
-    let secret_raw = setting_val("graph_client_secret");
-    let secret_display = if secret_raw.len() > 8 {
-        format!("{}...{}", &secret_raw[..4], &secret_raw[secret_raw.len()-4..])
-    } else if !secret_raw.is_empty() {
-        "••••••••".to_string()
-    } else {
-        String::new()
-    };
-
     let host_rows: String = hosts.iter().map(|h| {
         format!(r##"<tr>
             <td>{}</td><td>{}</td><td>{}</td><td>{}</td>
@@ -1737,42 +1782,16 @@ pub fn admin_page(
         <!-- Calendar / Graph API -->
         <div class="card">
             <h3>Microsoft 365 Calendar Integration</h3>
-            <p style="color:var(--text-dim);font-size:0.85rem;margin-bottom:1rem;">
-                Connect to Microsoft Graph API to automatically create calendar invites
-                for the receptionist, host, and visitor when visits are scheduled.
+            <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem;">
+                <span>Status:</span> {graph_badge}
+            </div>
+            <p style="color:var(--text-dim);font-size:0.85rem;">
+                Calendar and email credentials are configured via environment variables
+                in the <code>.env</code> file for security. Set <code>GRAPH_TENANT_ID</code>,
+                <code>GRAPH_CLIENT_ID</code>, <code>GRAPH_CLIENT_SECRET</code>,
+                <code>GRAPH_GROUP_ID</code>, and <code>GRAPH_GROUP_EMAIL</code>,
+                then restart GateKeeper.
             </p>
-            <form hx-post="/admin/settings/graph" hx-target="#graph-result" hx-swap="innerHTML">
-                <div id="graph-result"></div>
-                <div class="form-grid">
-                    <div class="form-group">
-                        <label>Tenant ID</label>
-                        <input type="text" name="graph_tenant_id" value="{graph_tenant_id}"
-                               placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
-                    </div>
-                    <div class="form-group">
-                        <label>Client ID</label>
-                        <input type="text" name="graph_client_id" value="{graph_client_id}"
-                               placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
-                    </div>
-                    <div class="form-group">
-                        <label>Client Secret</label>
-                        <input type="password" name="graph_client_secret"
-                               placeholder="{secret_placeholder}" value="">
-                        <small style="color:var(--text-dim);">Leave blank to keep current value</small>
-                    </div>
-                    <div class="form-group">
-                        <label>Group ID (O365 Group)</label>
-                        <input type="text" name="graph_group_id" value="{graph_group_id}"
-                               placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
-                    </div>
-                    <div class="form-group">
-                        <label>Group Email</label>
-                        <input type="email" name="graph_group_email" value="{graph_group_email}"
-                               placeholder="group@company.com">
-                    </div>
-                </div>
-                <button type="submit" class="btn btn-primary" style="margin-top:0.5rem;">Save Calendar Settings</button>
-            </form>
         </div>
 
         <!-- Host Management -->
@@ -1821,21 +1840,6 @@ pub fn admin_page(
             </div>
         </div>
 
-        <!-- Setup Guide -->
-        <div class="card">
-            <h3>Calendar Setup Guide</h3>
-            <ol style="padding-left:1.25rem;color:var(--text-dim);font-size:0.85rem;line-height:1.8;">
-                <li>Go to <strong>Azure Portal</strong> → Azure Active Directory → App registrations → New registration</li>
-                <li>Name: "GateKeeper Calendar", Single tenant, No redirect URI</li>
-                <li>Copy <strong>Application (client) ID</strong> → paste above as Client ID</li>
-                <li>Copy <strong>Directory (tenant) ID</strong> → paste above as Tenant ID</li>
-                <li>Go to <strong>Certificates &amp; secrets</strong> → New client secret → copy value → paste as Client Secret</li>
-                <li>Go to <strong>API Permissions</strong> → Add → Microsoft Graph → Application → <strong>Calendars.ReadWrite</strong></li>
-                <li>Click <strong>Grant admin consent</strong> (requires Global Admin)</li>
-                <li>Go to <strong>Azure AD → Groups</strong> → find your O365 group → copy Object ID → paste as Group ID</li>
-                <li>Save settings and restart GateKeeper</li>
-            </ol>
-        </div>
     "##,
         host_count = host_count,
         visitor_count = visitor_count,
@@ -1873,11 +1877,6 @@ pub fn admin_page(
         pr_48 = if setting_val("photo_retention_hours") == "48" { "selected" } else { "" },
         pr_72 = if setting_val("photo_retention_hours") == "72" { "selected" } else { "" },
         pr_168 = if setting_val("photo_retention_hours") == "168" { "selected" } else { "" },
-        graph_tenant_id = setting_val("graph_tenant_id"),
-        graph_client_id = setting_val("graph_client_id"),
-        secret_placeholder = if secret_display.is_empty() { "Enter client secret" } else { &secret_display },
-        graph_group_id = setting_val("graph_group_id"),
-        graph_group_email = setting_val("graph_group_email"),
         smtp_from_address = setting_val("smtp_from_address"),
         smtp_from_name = setting_val("smtp_from_name"),
         badge_primary_color = {

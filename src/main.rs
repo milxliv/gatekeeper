@@ -8,9 +8,11 @@ mod templates;
 
 use std::sync::Arc;
 use axum::{
+    extract::State,
     http::header,
+    middleware,
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{get, post},
     Router,
 };
 use std::net::SocketAddr;
@@ -25,6 +27,48 @@ pub struct AppState {
     pub db: db::DbPool,
     pub graph: Option<Arc<graph_service::GraphService>>,
     pub photos_dir: std::path::PathBuf,
+    pub password_hash: Option<String>,
+}
+
+/// Auth middleware — redirects to /login if no valid session cookie.
+/// Passes through if no password is configured (backward compat).
+async fn require_auth(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    // If no password configured, pass through (backward compat)
+    if state.password_hash.is_none() {
+        return next.run(request).await;
+    }
+
+    // Public paths that don't require auth
+    let path = request.uri().path().to_string();
+    if path == "/login"
+        || path.starts_with("/static/")
+        || path == "/api/kiosk/checkin"
+        || path.starts_with("/badge/")
+        || path == "/photos/logo.png"
+    {
+        return next.run(request).await;
+    }
+
+    // Extract session cookie
+    if let Some(cookie_header) = request.headers().get("cookie") {
+        if let Ok(cookies) = cookie_header.to_str() {
+            for cookie in cookies.split(';') {
+                let cookie = cookie.trim();
+                if let Some(token) = cookie.strip_prefix("gk_session=") {
+                    if db::validate_session(&state.db, token) {
+                        return next.run(request).await;
+                    }
+                }
+            }
+        }
+    }
+
+    // Not authenticated — redirect to login
+    axum::response::Redirect::to("/login").into_response()
 }
 
 #[tokio::main]
@@ -50,6 +94,24 @@ async fn main() {
     // Seed some demo hosts if the table is empty
     seed_demo_data(&pool);
 
+    // Admin password — hash from env var
+    let password_hash = match std::env::var("GATEKEEPER_PASSWORD") {
+        Ok(pw) if !pw.is_empty() => {
+            use sha2::Digest;
+            let hash = sha2::Sha256::digest(pw.as_bytes());
+            let hex_hash = hex::encode(hash);
+            tracing::info!("Admin authentication enabled");
+            Some(hex_hash)
+        }
+        _ => {
+            tracing::warn!(
+                "GATEKEEPER_PASSWORD not set — admin panel is unprotected! \
+                 Set this env var to enable login."
+            );
+            None
+        }
+    };
+
     // Graph service — optional, gracefully disabled if env vars missing
     let graph = match graph_service::GraphService::from_env() {
         Ok(svc) => {
@@ -69,14 +131,14 @@ async fn main() {
     );
     std::fs::create_dir_all(&photos_dir).expect("Failed to create photos directory");
 
-    let state = Arc::new(AppState { db: pool, graph, photos_dir });
+    let state = Arc::new(AppState { db: pool, graph, photos_dir, password_hash });
 
-    // Background photo cleanup task
+    // Background cleanup task (photos + expired sessions)
     {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            // Run cleanup on startup, then every hour
             loop {
+                // Photo cleanup
                 let hours: i64 = db::get_setting(&state.db, "photo_retention_hours")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(24);
@@ -99,12 +161,18 @@ async fn main() {
                     }
                 }
 
+                // Session cleanup
+                db::cleanup_expired_sessions(&state.db);
+
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }
         });
     }
 
     let app = Router::new()
+        // Auth routes (public)
+        .route("/login", get(routes::page_login).post(routes::api_login))
+        .route("/logout", post(routes::api_logout))
         // Embedded static assets
         .route("/static/htmx.min.js", get(serve_htmx))
         // Page routes
@@ -115,7 +183,6 @@ async fn main() {
         .route("/log", get(routes::page_log))
         .route("/admin", get(routes::page_admin))
         .route("/admin/settings", post(routes::api_save_general_settings))
-        .route("/admin/settings/graph", post(routes::api_save_graph_settings))
         .route("/admin/settings/smtp", post(routes::api_save_smtp_settings))
         .route("/admin/settings/smtp/test", post(routes::api_test_smtp))
         .route("/admin/settings/theme", post(routes::api_save_theme))
@@ -146,6 +213,8 @@ async fn main() {
         .route("/api/hosts/search", get(routes::api_search_hosts))
         .route("/api/visitors/:id/photo", post(routes::api_upload_photo))
         .route("/photos/:filename", get(routes::serve_photo))
+        // Auth middleware — applied to all routes
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state);
 
     let port: u16 = std::env::var("GATEKEEPER_PORT")

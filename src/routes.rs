@@ -14,6 +14,74 @@ use crate::models::*;
 use crate::templates;
 use crate::AppState;
 
+// ── Auth handlers ─────────────────────────────────────────────
+
+pub async fn page_login(State(state): State<Arc<AppState>>) -> Html<String> {
+    // If no password set, redirect to dashboard
+    if state.password_hash.is_none() {
+        return Html(r#"<script>window.location='/';</script>"#.to_string());
+    }
+    Html(templates::login_page(None))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoginForm {
+    pub password: String,
+}
+
+pub async fn api_login(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<LoginForm>,
+) -> impl IntoResponse {
+    let expected = match &state.password_hash {
+        Some(h) => h,
+        None => {
+            return axum::response::Redirect::to("/").into_response();
+        }
+    };
+
+    use sha2::Digest;
+    let submitted_hash = hex::encode(sha2::Sha256::digest(form.password.as_bytes()));
+
+    if submitted_hash == *expected {
+        // Create session
+        let token = uuid::Uuid::new_v4().to_string();
+        let _ = db::create_session(&state.db, &token, 24);
+        let cookie = format!(
+            "gk_session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400",
+            token
+        );
+        (
+            [(axum::http::header::SET_COOKIE, cookie)],
+            axum::response::Redirect::to("/"),
+        ).into_response()
+    } else {
+        Html(templates::login_page(Some("Invalid password."))).into_response()
+    }
+}
+
+pub async fn api_logout(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // Extract and delete session
+    if let Some(cookie_header) = headers.get("cookie") {
+        if let Ok(cookies) = cookie_header.to_str() {
+            for cookie in cookies.split(';') {
+                let cookie = cookie.trim();
+                if let Some(token) = cookie.strip_prefix("gk_session=") {
+                    db::delete_session(&state.db, token);
+                }
+            }
+        }
+    }
+    let clear_cookie = "gk_session=; Path=/; HttpOnly; Max-Age=0";
+    (
+        [(axum::http::header::SET_COOKIE, clear_cookie)],
+        axum::response::Redirect::to("/login"),
+    )
+}
+
 // ── Theme helper ──────────────────────────────────────────────
 
 fn apply_theme(state: &AppState) {
@@ -948,41 +1016,6 @@ pub async fn page_badge_preview(
     };
 
     Html(templates::badge_page_preview(&sample, None, &bs.as_opts()))
-}
-
-#[derive(Debug, Deserialize)]
-pub struct GraphSettingsForm {
-    pub graph_tenant_id: String,
-    pub graph_client_id: String,
-    pub graph_client_secret: String,
-    pub graph_group_id: String,
-    pub graph_group_email: String,
-}
-
-pub async fn api_save_graph_settings(
-    State(state): State<Arc<AppState>>,
-    Form(form): Form<GraphSettingsForm>,
-) -> Html<String> {
-    let pairs = [
-        ("graph_tenant_id", form.graph_tenant_id.as_str()),
-        ("graph_client_id", form.graph_client_id.as_str()),
-        ("graph_group_id", form.graph_group_id.as_str()),
-        ("graph_group_email", form.graph_group_email.as_str()),
-    ];
-    for (key, val) in &pairs {
-        if let Err(e) = db::set_setting(&state.db, key, val) {
-            return Html(templates::alert_error(&format!("Failed to save: {}", e)));
-        }
-    }
-    // Only update secret if a new one was provided
-    if !form.graph_client_secret.is_empty() {
-        if let Err(e) = db::set_setting(&state.db, "graph_client_secret", &form.graph_client_secret) {
-            return Html(templates::alert_error(&format!("Failed to save secret: {}", e)));
-        }
-    }
-    Html(templates::alert_success(
-        "Calendar settings saved. Restart GateKeeper to apply changes."
-    ))
 }
 
 #[derive(Debug, Deserialize)]

@@ -94,6 +94,23 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         [],
     );
 
+    // Sessions table for admin auth
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sessions (
+            token       TEXT PRIMARY KEY,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            expires_at  TEXT NOT NULL
+        );"
+    )?;
+
+    // V2: Remove graph secrets from settings (now env-var only)
+    let _ = conn.execute_batch(
+        "DELETE FROM settings WHERE key IN (
+            'graph_tenant_id', 'graph_client_id', 'graph_client_secret',
+            'graph_group_id', 'graph_group_email'
+        );"
+    );
+
     // Settings table (key-value, admin-configurable)
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS settings (
@@ -109,11 +126,6 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         ("timezone", "Eastern Standard Time"),
         ("receptionist_email", ""),
         ("badge_expiry_text", "VALID TODAY ONLY"),
-        ("graph_tenant_id", ""),
-        ("graph_client_id", ""),
-        ("graph_client_secret", ""),
-        ("graph_group_id", ""),
-        ("graph_group_email", ""),
         ("smtp_host", ""),
         ("smtp_port", "587"),
         ("smtp_username", ""),
@@ -145,6 +157,44 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── Session queries ──────────────────────────────────────────
+
+pub fn create_session(db: &DbPool, token: &str, expires_hours: i64) -> Result<()> {
+    let conn = db.lock().unwrap();
+    let now = chrono::Local::now();
+    let expires = now + chrono::Duration::hours(expires_hours);
+    conn.execute(
+        "INSERT INTO sessions (token, created_at, expires_at) VALUES (?1, ?2, ?3)",
+        params![
+            token,
+            now.format("%Y-%m-%d %H:%M:%S").to_string(),
+            expires.format("%Y-%m-%d %H:%M:%S").to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn validate_session(db: &DbPool, token: &str) -> bool {
+    let conn = db.lock().unwrap();
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    conn.query_row(
+        "SELECT 1 FROM sessions WHERE token = ?1 AND expires_at > ?2",
+        params![token, now],
+        |_| Ok(()),
+    ).is_ok()
+}
+
+pub fn delete_session(db: &DbPool, token: &str) {
+    let conn = db.lock().unwrap();
+    let _ = conn.execute("DELETE FROM sessions WHERE token = ?1", params![token]);
+}
+
+pub fn cleanup_expired_sessions(db: &DbPool) {
+    let conn = db.lock().unwrap();
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let _ = conn.execute("DELETE FROM sessions WHERE expires_at < ?1", params![now]);
 }
 
 // ── Settings queries ──────────────────────────────────────────

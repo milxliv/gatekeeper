@@ -123,19 +123,14 @@ async fn send_graph_email(
     Ok(())
 }
 
-/// Get a Graph API token using settings from DB (or env fallback)
-async fn get_graph_token(db: &DbPool) -> Result<String> {
-    let get = |key: &str| crate::db::get_setting(db, key).filter(|s| !s.is_empty());
-
-    let tenant_id = get("graph_tenant_id")
-        .or_else(|| std::env::var("GRAPH_TENANT_ID").ok())
-        .context("Graph tenant ID not configured")?;
-    let client_id = get("graph_client_id")
-        .or_else(|| std::env::var("GRAPH_CLIENT_ID").ok())
-        .context("Graph client ID not configured")?;
-    let client_secret = get("graph_client_secret")
-        .or_else(|| std::env::var("GRAPH_CLIENT_SECRET").ok())
-        .context("Graph client secret not configured")?;
+/// Get a Graph API token using environment variables only
+async fn get_graph_token(_db: &DbPool) -> Result<String> {
+    let tenant_id = std::env::var("GRAPH_TENANT_ID")
+        .context("GRAPH_TENANT_ID env var not set")?;
+    let client_id = std::env::var("GRAPH_CLIENT_ID")
+        .context("GRAPH_CLIENT_ID env var not set")?;
+    let client_secret = std::env::var("GRAPH_CLIENT_SECRET")
+        .context("GRAPH_CLIENT_SECRET env var not set")?;
 
     let url = format!(
         "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
