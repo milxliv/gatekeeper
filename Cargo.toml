@@ -22,3 +22,5 @@ dotenvy = "0.15"
 anyhow = "1"
 sha2 = "0.10"
 hex = "0.4"
+argon2 = { version = "0.5", features = ["std"] }
+password-hash = { version = "0.5", features = ["rand_core"] }

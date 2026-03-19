@@ -57,6 +57,9 @@ pub struct Visit {
     pub check_in: Option<String>,
     pub check_out: Option<String>,
     pub created_at: String,
+    pub is_group: bool,
+    pub group_name: Option<String>,
+    pub group_size: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +75,9 @@ pub struct NewVisit {
     pub expected_date: Option<String>,
     pub expected_time: Option<String>,
     pub duration_minutes: Option<i32>,
+    pub is_group: bool,
+    pub group_name: Option<String>,
+    pub group_size: Option<i32>,
 }
 
 // ── Joined view for display ───────────────────────────────────
@@ -94,6 +100,9 @@ pub struct VisitDetail {
     pub created_at: String,
     pub visitor: VisitorInfo,
     pub host: HostInfo,
+    pub is_group: bool,
+    pub group_name: Option<String>,
+    pub group_size: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -140,6 +149,20 @@ pub struct WalkInForm {
     pub purpose: String,
     pub visitor_type: Option<String>,
     pub areas_requested: Option<String>,
+    pub special_notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GroupVisitForm {
+    pub group_name: String,
+    pub group_size: i32,
+    pub host_id: String,
+    pub purpose: String,
+    pub visitor_type: Option<String>,
+    pub areas_requested: Option<String>,
+    pub expected_date: String,
+    pub expected_time: Option<String>,
+    pub duration: Option<String>,
     pub special_notes: Option<String>,
 }
 

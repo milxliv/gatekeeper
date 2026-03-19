@@ -94,6 +94,11 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         [],
     );
 
+    // Group visit columns
+    let _ = conn.execute("ALTER TABLE visits ADD COLUMN is_group INTEGER DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE visits ADD COLUMN group_name TEXT", []);
+    let _ = conn.execute("ALTER TABLE visits ADD COLUMN group_size INTEGER", []);
+
     // Sessions table for auth
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS sessions (
@@ -456,8 +461,8 @@ pub fn create_visit(db: &DbPool, visit: &NewVisit) -> Result<String> {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let conn = db.lock().unwrap();
     conn.execute(
-        "INSERT INTO visits (id, visitor_id, host_id, purpose, areas_requested, special_notes, visitor_type, status, pre_registered, expected_date, expected_time, duration_minutes, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+        "INSERT INTO visits (id, visitor_id, host_id, purpose, areas_requested, special_notes, visitor_type, status, pre_registered, expected_date, expected_time, duration_minutes, is_group, group_name, group_size, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
         params![
             id,
             visit.visitor_id,
@@ -471,6 +476,9 @@ pub fn create_visit(db: &DbPool, visit: &NewVisit) -> Result<String> {
             visit.expected_date,
             visit.expected_time,
             visit.duration_minutes,
+            visit.is_group,
+            visit.group_name,
+            visit.group_size,
             now,
         ],
     )?;
@@ -485,6 +493,29 @@ pub fn check_in_visit(db: &DbPool, visit_id: &str, badge_number: Option<&str>) -
         params![now, badge_number, visit_id],
     )?;
     Ok(())
+}
+
+/// Promote rescheduled visits to pending when their expected date arrives
+pub fn promote_rescheduled_visits(db: &DbPool) -> usize {
+    let conn = db.lock().unwrap();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    conn.execute(
+        "UPDATE visits SET status = 'pending' WHERE status = 'rescheduled' AND date(expected_date) <= ?1",
+        params![today],
+    )
+    .unwrap_or(0)
+}
+
+pub fn check_out_all_today(db: &DbPool) -> Result<usize> {
+    let conn = db.lock().unwrap();
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let count = conn.execute(
+        "UPDATE visits SET status = 'checked_out', check_out = ?1, updated_at = ?1
+         WHERE status = 'checked_in' AND date(check_in) = ?2",
+        params![now, today],
+    )?;
+    Ok(count)
 }
 
 pub fn check_out_visit(db: &DbPool, visit_id: &str) -> Result<()> {
@@ -595,6 +626,9 @@ fn visit_detail_from_row(row: &rusqlite::Row) -> Result<VisitDetail> {
             email: row.get(21)?,
             phone: row.get(22)?,
         },
+        is_group: row.get::<_, Option<i64>>(23)?.unwrap_or(0) != 0,
+        group_name: row.get(24)?,
+        group_size: row.get(25)?,
     })
 }
 
@@ -605,7 +639,8 @@ pub fn get_visit_detail(db: &DbPool, visit_id: &str) -> Result<Option<VisitDetai
                 v.visitor_type, v.pre_registered, v.expected_date, v.expected_time, v.duration_minutes,
                 v.check_in, v.check_out, v.created_at,
                 vis.id, vis.name, vis.company, vis.phone,
-                h.id, h.name, h.department, h.email, h.phone
+                h.id, h.name, h.department, h.email, h.phone,
+                v.is_group, v.group_name, v.group_size
          FROM visits v
          JOIN visitors vis ON v.visitor_id = vis.id
          JOIN hosts h ON v.host_id = h.id
@@ -628,7 +663,8 @@ pub fn list_visits_today(db: &DbPool) -> Result<Vec<VisitDetail>> {
                 v.visitor_type, v.pre_registered, v.expected_date, v.expected_time, v.duration_minutes,
                 v.check_in, v.check_out, v.created_at,
                 vis.id, vis.name, vis.company, vis.phone,
-                h.id, h.name, h.department, h.email, h.phone
+                h.id, h.name, h.department, h.email, h.phone,
+                v.is_group, v.group_name, v.group_size
          FROM visits v
          JOIN visitors vis ON v.visitor_id = vis.id
          JOIN hosts h ON v.host_id = h.id
@@ -664,7 +700,8 @@ pub fn list_preregistered_upcoming(db: &DbPool) -> Result<Vec<VisitDetail>> {
                 v.visitor_type, v.pre_registered, v.expected_date, v.expected_time, v.duration_minutes,
                 v.check_in, v.check_out, v.created_at,
                 vis.id, vis.name, vis.company, vis.phone,
-                h.id, h.name, h.department, h.email, h.phone
+                h.id, h.name, h.department, h.email, h.phone,
+                v.is_group, v.group_name, v.group_size
          FROM visits v
          JOIN visitors vis ON v.visitor_id = vis.id
          JOIN hosts h ON v.host_id = h.id
@@ -687,7 +724,8 @@ pub fn search_visits(db: &DbPool, query: &str, from: Option<&str>, to: Option<&s
                 v.visitor_type, v.pre_registered, v.expected_date, v.expected_time, v.duration_minutes,
                 v.check_in, v.check_out, v.created_at,
                 vis.id, vis.name, vis.company, vis.phone,
-                h.id, h.name, h.department, h.email, h.phone
+                h.id, h.name, h.department, h.email, h.phone,
+                v.is_group, v.group_name, v.group_size
          FROM visits v
          JOIN visitors vis ON v.visitor_id = vis.id
          JOIN hosts h ON v.host_id = h.id

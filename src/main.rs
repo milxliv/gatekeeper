@@ -110,10 +110,14 @@ async fn main() {
     // Seed some demo hosts if the table is empty
     seed_demo_data(&pool);
 
-    // Password hashing helper
+    // Password hashing helper (argon2 — salted, resistant to rainbow tables)
     let hash_password = |pw: &str| -> String {
-        use sha2::Digest;
-        hex::encode(sha2::Sha256::digest(pw.as_bytes()))
+        use argon2::password_hash::{PasswordHasher, SaltString, rand_core};
+        let salt = SaltString::generate(&mut rand_core::OsRng);
+        argon2::Argon2::default()
+            .hash_password(pw.as_bytes(), &salt)
+            .expect("Failed to hash password")
+            .to_string()
     };
 
     // Front desk password
@@ -166,6 +170,12 @@ async fn main() {
 
     let state = Arc::new(AppState { db: pool, graph, photos_dir, password_hash, admin_password_hash });
 
+    // Promote rescheduled visits whose expected date has arrived
+    let promoted = db::promote_rescheduled_visits(&state.db);
+    if promoted > 0 {
+        tracing::info!("Promoted {} rescheduled visit(s) to pending", promoted);
+    }
+
     // Background cleanup task (photos + expired sessions)
     {
         let state = Arc::clone(&state);
@@ -197,6 +207,12 @@ async fn main() {
                 // Session cleanup
                 db::cleanup_expired_sessions(&state.db);
 
+                // Promote rescheduled visits whose date has arrived
+                let promoted = db::promote_rescheduled_visits(&state.db);
+                if promoted > 0 {
+                    tracing::info!("Promoted {} rescheduled visit(s) to pending", promoted);
+                }
+
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }
         });
@@ -212,6 +228,7 @@ async fn main() {
         .route("/", get(routes::page_dashboard))
         .route("/pre-register", get(routes::page_pre_register))
         .route("/walk-in", get(routes::page_walk_in))
+        .route("/group-visit", get(routes::page_group_visit))
         .route("/hosts", get(routes::page_hosts))
         .route("/log", get(routes::page_log))
         .route("/admin", get(routes::page_admin))
@@ -227,6 +244,7 @@ async fn main() {
         .route("/api/dashboard/today", get(routes::api_dashboard_today))
         .route("/api/pre-register", post(routes::api_pre_register))
         .route("/api/walk-in", post(routes::api_walk_in))
+        .route("/api/group-visit", post(routes::api_group_visit))
         .route("/api/hosts", post(routes::api_add_host))
         .route("/api/hosts/:id", post(routes::api_update_host).delete(routes::api_delete_host))
         .route("/api/visits/:id/approve", post(routes::api_approve_visit))
@@ -234,6 +252,7 @@ async fn main() {
         .route("/api/visits/:id/late", post(routes::api_late_visit))
         .route("/api/visits/:id/reschedule", post(routes::api_reschedule_visit))
         .route("/api/visits/:id/checkin", post(routes::api_checkin_visit))
+        .route("/api/visits/checkout-all", post(routes::api_checkout_all))
         .route("/api/visits/:id/checkout", post(routes::api_checkout_visit))
         .route("/api/log/search", get(routes::api_log_search))
         // Kiosk JSON API

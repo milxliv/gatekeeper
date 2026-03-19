@@ -37,19 +37,24 @@ pub async fn api_login(
         return axum::response::Redirect::to("/").into_response();
     }
 
-    use sha2::Digest;
-    let submitted_hash = hex::encode(sha2::Sha256::digest(form.password.as_bytes()));
+    use argon2::{Argon2, PasswordVerifier, PasswordHash};
+
+    let verify = |hash: &str| -> bool {
+        PasswordHash::new(hash)
+            .map(|parsed| Argon2::default().verify_password(form.password.as_bytes(), &parsed).is_ok())
+            .unwrap_or(false)
+    };
 
     // Check admin password first, then front desk password
     let role = if let Some(ref admin_hash) = state.admin_password_hash {
-        if submitted_hash == *admin_hash {
+        if verify(admin_hash) {
             Some("admin")
-        } else if state.password_hash.as_deref() == Some(&submitted_hash) {
+        } else if state.password_hash.as_deref().is_some_and(|h| verify(h)) {
             Some("user")
         } else {
             None
         }
-    } else if state.password_hash.as_deref() == Some(&submitted_hash) {
+    } else if state.password_hash.as_deref().is_some_and(|h| verify(h)) {
         // No separate admin password — front desk password grants admin
         Some("admin")
     } else {
@@ -126,7 +131,8 @@ pub async fn page_dashboard(
     apply_role(&role);
     let visits = db::list_visits_today(&state.db).unwrap_or_default();
     let upcoming = db::list_preregistered_upcoming(&state.db).unwrap_or_default();
-    Html(templates::dashboard_page(&visits, &upcoming))
+    let graph_connected = state.graph.is_some();
+    Html(templates::dashboard_page(&visits, &upcoming, graph_connected))
 }
 
 pub async fn page_pre_register(
@@ -238,6 +244,9 @@ pub async fn api_pre_register(
         expected_date: Some(form.expected_date),
         expected_time: expected_time_str.clone(),
         duration_minutes: duration_mins,
+        is_group: false,
+        group_name: None,
+        group_size: None,
     };
 
     match db::create_visit(&state.db, &visit) {
@@ -377,6 +386,9 @@ pub async fn api_walk_in(
         expected_date: Some(today),
         expected_time: None,
         duration_minutes: None,
+        is_group: false,
+        group_name: None,
+        group_size: None,
     };
 
     match db::create_visit(&state.db, &visit) {
@@ -422,6 +434,91 @@ pub async fn api_walk_in(
         }
         Err(e) => {
             Html(templates::alert_error(&format!("Failed to check in: {}", e)))
+        }
+    }
+}
+
+// ── Group Visit ─────────────────────────────────────────────
+
+pub async fn page_group_visit(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(role): axum::Extension<crate::UserRole>,
+) -> Html<String> {
+    apply_theme(&state);
+    apply_role(&role);
+    let hosts = db::list_hosts(&state.db).unwrap_or_default();
+    let purposes = db::get_setting(&state.db, "purpose_list")
+        .unwrap_or_else(|| "Meeting,Sales Call,Interview,Vendor / Install,Tour,Delivery".to_string());
+    let areas = db::get_setting(&state.db, "area_list")
+        .unwrap_or_else(|| "Studios,Master Control,Rack Room,Transmitter,Newsroom,Offices,Multiple Areas".to_string());
+    let visitor_types = db::get_setting(&state.db, "visitor_type_list")
+        .unwrap_or_else(|| "Visitor,Guest,Contractor,Vendor,Interview".to_string());
+    Html(templates::group_visit_page(&hosts, &purposes, &areas, &visitor_types))
+}
+
+pub async fn api_group_visit(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<GroupVisitForm>,
+) -> Html<String> {
+    let group_name = form.group_name.trim().to_string();
+    if group_name.is_empty() || form.host_id.trim().is_empty() {
+        return Html(templates::alert_error("Group name and host are required."));
+    }
+    if form.group_size < 2 || form.group_size > 200 {
+        return Html(templates::alert_error("Group size must be between 2 and 200."));
+    }
+
+    // Create a synthetic visitor record for the group
+    let visitor = NewVisitor {
+        name: group_name.clone(),
+        company: None,
+        phone: None,
+        email: None,
+        notes: Some(format!("Group of {}", form.group_size)),
+    };
+
+    let visitor_id = match db::find_or_create_visitor(&state.db, &visitor) {
+        Ok(id) => id,
+        Err(e) => {
+            return Html(templates::alert_error(&format!("Database error: {}", e)));
+        }
+    };
+
+    let duration_mins: Option<i32> = form.duration.as_deref()
+        .and_then(|d| d.parse().ok());
+    let visitor_type = form.visitor_type
+        .unwrap_or_else(|| "Visitor".to_string());
+    let visit = NewVisit {
+        visitor_id,
+        host_id: form.host_id,
+        purpose: form.purpose,
+        areas_requested: non_empty(form.areas_requested),
+        special_notes: non_empty(form.special_notes),
+        visitor_type,
+        status: "pending".to_string(),
+        pre_registered: true,
+        expected_date: Some(form.expected_date),
+        expected_time: non_empty(form.expected_time),
+        duration_minutes: duration_mins,
+        is_group: true,
+        group_name: Some(group_name.clone()),
+        group_size: Some(form.group_size),
+    };
+
+    match db::create_visit(&state.db, &visit) {
+        Ok(_visit_id) => {
+            let host = db::get_host(&state.db, &visit.host_id).ok().flatten();
+            let host_name = host.as_ref()
+                .map(|h| h.name.clone())
+                .unwrap_or_else(|| "the host".to_string());
+
+            Html(templates::alert_success(&format!(
+                "Group \"{}\" ({} members) registered. {} will be notified.",
+                group_name, form.group_size, host_name
+            )))
+        }
+        Err(e) => {
+            Html(templates::alert_error(&format!("Failed to register group: {}", e)))
         }
     }
 }
@@ -648,6 +745,21 @@ pub async fn api_checkout_visit(
     Html("<tr><td colspan='9'>Checked out</td></tr>".to_string())
 }
 
+/// Check out all currently checked-in visitors at once
+pub async fn api_checkout_all(
+    State(state): State<Arc<AppState>>,
+) -> Html<String> {
+    let _ = db::check_out_all_today(&state.db);
+    let visits = db::list_visits_today(&state.db).unwrap_or_default();
+    let rows = if visits.is_empty() {
+        "<p style='color:var(--text-dim);padding:1rem;'>No visitors today.</p>"
+            .to_string()
+    } else {
+        render_full_table(&visits, true)
+    };
+    Html(rows)
+}
+
 /// Search the visitor log
 pub async fn api_log_search(
     State(state): State<Arc<AppState>>,
@@ -723,6 +835,9 @@ pub async fn api_kiosk_checkin(
         expected_date: Some(today),
         expected_time: None,
         duration_minutes: None,
+        is_group: false,
+        group_name: None,
+        group_size: None,
     };
 
     let visit_id = db::create_visit(&state.db, &visit)
@@ -1050,17 +1165,20 @@ pub async fn page_badge_preview(
         created_at: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
         visitor: crate::models::VisitorInfo {
             id: "sample".to_string(),
-            name: "Jane Doe".to_string(),
+            name: "First Lastname".to_string(),
             company: Some("Acme Corp".to_string()),
             phone: None,
         },
         host: crate::models::HostInfo {
             id: "sample-host".to_string(),
-            name: "John Smith".to_string(),
-            department: "Engineering".to_string(),
+            name: "First Lastname".to_string(),
+            department: "Department".to_string(),
             email: "john@company.com".to_string(),
             phone: None,
         },
+        is_group: false,
+        group_name: None,
+        group_size: None,
     };
 
     Html(templates::badge_page_preview(&sample, None, &bs.as_opts()))
@@ -1137,11 +1255,19 @@ pub async fn page_badge(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    let bs = BadgeSettings::load(&state.db);
+
+    // Group visits get a multi-badge page
+    if detail.is_group {
+        let group_size = detail.group_size.unwrap_or(1);
+        let html = templates::group_badge_page(&detail, &bs.as_opts(), group_size);
+        return Ok(Html(html));
+    }
+
     let photo = db::get_visitor_photo(&state.db, &detail.visitor.id)
         .ok()
         .flatten();
 
-    let bs = BadgeSettings::load(&state.db);
     let is_preview = query.preview.as_deref() == Some("1");
 
     let html = if is_preview {

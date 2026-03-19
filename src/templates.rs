@@ -1,6 +1,224 @@
 use crate::models::*;
 use std::cell::RefCell;
 
+/// Pixel-quantization script for 2-color thermal printers (Brother QL-820NWB).
+///
+/// The printer has separate black and red thermal heads. Any pixel that isn't
+/// exactly (0,0,0) gets routed to the red head. Anti-aliased text produces gray
+/// edge pixels (e.g. #2a2a2a) which the printer classifies as "not black" → red.
+///
+/// This script intercepts window.print(), rasterizes the badge HTML to a canvas
+/// via SVG foreignObject, then snaps every pixel to one of three values:
+///   - Pure white  (255, 255, 255)
+///   - Pure black  (0, 0, 0)
+///   - Pure red    (255, 0, 0)
+/// The quantized bitmap is then printed instead of the raw HTML.
+/// Group badge variant — quantizes each badge-sheet div separately, then prints
+/// all as a sequence of full-page images.
+const QUANTIZE_GROUP_PRINT_JS: &str = r##"
+async function quantizeGroupAndPrint() {
+  try {
+    var sheets = document.querySelectorAll('.badge-sheet');
+    if (sheets.length === 0) { window.print(); return; }
+
+    var styleEl = document.querySelector('style');
+    var css = styleEl ? styleEl.textContent : '';
+    css = css.replace(/@media\s+(screen|print)\s*\{[^}]*\}/g, '');
+
+    // Convert images to base64
+    var imgs = document.querySelectorAll('img');
+    for (var j = 0; j < imgs.length; j++) {
+      var im = imgs[j];
+      if (im.complete && im.naturalWidth > 0 && !im.src.startsWith('data:')) {
+        try {
+          var tc = document.createElement('canvas');
+          tc.width = im.naturalWidth; tc.height = im.naturalHeight;
+          tc.getContext('2d').drawImage(im, 0, 0);
+          im.setAttribute('src', tc.toDataURL('image/png'));
+        } catch(e) {}
+      }
+    }
+
+    var scale = 8;
+    var canvases = [];
+
+    for (var s = 0; s < sheets.length; s++) {
+      var sheet = sheets[s];
+      var w = sheet.scrollWidth;
+      var h = sheet.scrollHeight;
+      var cw = w * scale;
+      var ch = h * scale;
+
+      var xhtml = '<div xmlns="http://www.w3.org/1999/xhtml"'
+        + ' style="width:' + w + 'px;height:' + h + 'px;overflow:hidden;'
+        + 'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;">'
+        + '<style>' + css + '</style>'
+        + sheet.outerHTML
+        + '</div>';
+
+      var svgStr = '<svg xmlns="http://www.w3.org/2000/svg" width="' + cw + '" height="' + ch + '">'
+        + '<foreignObject width="' + w + '" height="' + h + '" transform="scale(' + scale + ')">'
+        + xhtml
+        + '</foreignObject></svg>';
+
+      var cv = await new Promise(function(resolve, reject) {
+        var canvas = document.createElement('canvas');
+        canvas.width = cw; canvas.height = ch;
+        var ctx = canvas.getContext('2d');
+        var blob = new Blob([svgStr], {type: 'image/svg+xml;charset=utf-8'});
+        var url = URL.createObjectURL(blob);
+        var img = new Image();
+        img.onload = function() {
+          ctx.drawImage(img, 0, 0);
+          URL.revokeObjectURL(url);
+          var imageData = ctx.getImageData(0, 0, cw, ch);
+          var d = imageData.data;
+          for (var i = 0; i < d.length; i += 4) {
+            var r = d[i], g = d[i+1], b = d[i+2], a = d[i+3];
+            if (a < 128) { d[i]=255;d[i+1]=255;d[i+2]=255;d[i+3]=255; continue; }
+            var luma = 0.299*r + 0.587*g + 0.114*b;
+            var isRed = (r > 150 && g < 100 && b < 100 && r > g * 2);
+            if (isRed) { d[i]=255;d[i+1]=0;d[i+2]=0; }
+            else if (luma < 200) { d[i]=0;d[i+1]=0;d[i+2]=0; }
+            else { d[i]=255;d[i+1]=255;d[i+2]=255; }
+            d[i+3]=255;
+          }
+          ctx.putImageData(imageData, 0, 0);
+          resolve(canvas);
+        };
+        img.onerror = function() { URL.revokeObjectURL(url); reject('render failed'); };
+        img.src = url;
+      });
+      canvases.push(cv);
+    }
+
+    // Replace page with canvas elements directly
+    document.head.innerHTML = '<style>'
+      + '@page{size:4in 2.4in;margin:0;}'
+      + '*{margin:0;padding:0;}'
+      + 'body{width:4in;}'
+      + 'canvas{display:block;width:4in;height:2.4in;image-rendering:pixelated;image-rendering:-moz-crisp-edges;image-rendering:crisp-edges;}'
+      + '</style>';
+    document.body.innerHTML = '';
+    for (var c = 0; c < canvases.length; c++) {
+      var cv = canvases[c];
+      cv.style.width = '4in';
+      cv.style.height = '2.4in';
+      cv.style.display = 'block';
+      cv.style.imageRendering = 'pixelated';
+      if (c < canvases.length - 1) cv.style.pageBreakAfter = 'always';
+      document.body.appendChild(cv);
+    }
+    setTimeout(function(){ window.print(); }, 300);
+  } catch(e) {
+    console.error('Group badge quantization failed:', e);
+    window.print();
+  }
+}
+quantizeGroupAndPrint();
+"##;
+
+const QUANTIZE_PRINT_JS: &str = r##"
+async function quantizeAndPrint() {
+  try {
+    var body = document.body;
+    var w = body.scrollWidth;
+    var h = body.scrollHeight;
+    var scale = 8;
+    var cw = w * scale;
+    var ch = h * scale;
+
+    // Convert <img> elements to inline base64 so foreignObject can render them
+    var imgs = document.querySelectorAll('img');
+    for (var j = 0; j < imgs.length; j++) {
+      var im = imgs[j];
+      if (im.complete && im.naturalWidth > 0 && !im.src.startsWith('data:')) {
+        try {
+          var tc = document.createElement('canvas');
+          tc.width = im.naturalWidth; tc.height = im.naturalHeight;
+          tc.getContext('2d').drawImage(im, 0, 0);
+          im.setAttribute('src', tc.toDataURL('image/png'));
+        } catch(e) {}
+      }
+    }
+
+    // Grab rendered CSS (strip @media screen/print blocks — they confuse foreignObject)
+    var styleEl = document.querySelector('style');
+    var css = styleEl ? styleEl.textContent : '';
+    css = css.replace(/@media\s+(screen|print)\s*\{[^}]*\}/g, '');
+
+    // Build XHTML wrapper for foreignObject
+    var xhtml = '<div xmlns="http://www.w3.org/1999/xhtml"'
+      + ' style="width:' + w + 'px;height:' + h + 'px;overflow:hidden;'
+      + 'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;">'
+      + '<style>' + css + '</style>'
+      + body.innerHTML
+      + '</div>';
+
+    var svgStr = '<svg xmlns="http://www.w3.org/2000/svg" width="' + cw + '" height="' + ch + '">'
+      + '<foreignObject width="' + w + '" height="' + h + '" transform="scale(' + scale + ')">'
+      + xhtml
+      + '</foreignObject></svg>';
+
+    var canvas = document.createElement('canvas');
+    canvas.width = cw; canvas.height = ch;
+    var ctx = canvas.getContext('2d');
+
+    var blob = new Blob([svgStr], {type: 'image/svg+xml;charset=utf-8'});
+    var url = URL.createObjectURL(blob);
+
+    var img = new Image();
+    img.onload = function() {
+      ctx.drawImage(img, 0, 0);
+      URL.revokeObjectURL(url);
+
+      // ── Pixel quantization: snap to black / white / red ──
+      // Threshold 200: anything even slightly dark → pure black.
+      // This eliminates ALL anti-aliased gray edge pixels.
+      var imageData = ctx.getImageData(0, 0, cw, ch);
+      var d = imageData.data;
+      for (var i = 0; i < d.length; i += 4) {
+        var r = d[i], g = d[i+1], b = d[i+2], a = d[i+3];
+        if (a < 128) { d[i]=255;d[i+1]=255;d[i+2]=255;d[i+3]=255; continue; }
+        var luma = 0.299*r + 0.587*g + 0.114*b;
+        // Detect intentionally red pixels (red channel dominant over green+blue)
+        var isRed = (r > 150 && g < 100 && b < 100 && r > g * 2);
+        if (isRed) { d[i]=255; d[i+1]=0; d[i+2]=0; }
+        else if (luma < 200) { d[i]=0; d[i+1]=0; d[i+2]=0; }
+        else { d[i]=255; d[i+1]=255; d[i+2]=255; }
+        d[i+3] = 255;
+      }
+      ctx.putImageData(imageData, 0, 0);
+
+      // Replace page with the canvas element directly (not an <img>).
+      // Canvas prints at its native pixel resolution — no browser resampling.
+      canvas.style.width = '4in';
+      canvas.style.height = '2.4in';
+      canvas.style.display = 'block';
+      canvas.style.imageRendering = 'pixelated';
+      document.head.innerHTML = '<style>'
+        + '@page{size:4in 2.4in;margin:0;}'
+        + '*{margin:0;padding:0;}'
+        + 'body{width:4in;height:2.4in;overflow:hidden;}'
+        + 'canvas{image-rendering:pixelated;image-rendering:-moz-crisp-edges;image-rendering:crisp-edges;}'
+        + '</style>';
+      document.body.innerHTML = '';
+      document.body.appendChild(canvas);
+      setTimeout(function(){ window.print(); }, 300);
+    };
+    img.onerror = function() {
+      URL.revokeObjectURL(url);
+      window.print();
+    };
+    img.src = url;
+  } catch(e) {
+    console.error('Badge quantization failed, falling back to raw print:', e);
+    window.print();
+  }
+}
+quantizeAndPrint();
+"##;
+
 /// Login page — standalone, no sidebar
 pub fn login_page(error: Option<&str>) -> String {
     let error_html = match error {
@@ -601,6 +819,17 @@ pub fn layout_with_theme(title: &str, content: &str, theme: &str) -> String {
         photoBlob = null;
         document.getElementById('camera-modal').style.display = 'none';
     }}
+
+    function checkInGroup(visitId, btn) {{
+        const row = btn.closest('tr');
+        const badgeWin = window.open('about:blank', '_blank');
+        fetch('/api/visits/' + visitId + '/checkin', {{ method: 'POST' }})
+            .then(r => r.text())
+            .then(html => {{
+                if (row) {{ row.outerHTML = html; }}
+                if (badgeWin) {{ badgeWin.location.href = '/badge/' + visitId; }}
+            }});
+    }}
     </script>
 </body>
 </html>"##, title = title, content = content, theme_attr = theme_attr, sidebar_nav = sidebar_nav())
@@ -623,6 +852,7 @@ fn sidebar_nav() -> String {
         <a href="/" class="active">Dashboard</a>
         <a href="/pre-register">Pre-Register Visitor</a>
         <a href="/walk-in">Walk-In Check-In</a>
+        <a href="/group-visit">Group Visit</a>
         <a href="/hosts">Manage Hosts</a>
         <a href="/log">Visitor Log</a>
         {admin_only}
@@ -633,11 +863,21 @@ fn sidebar_nav() -> String {
 }
 
 /// Dashboard page — today's visits + stats
-pub fn dashboard_page(visits: &[VisitDetail], upcoming: &[VisitDetail]) -> String {
+pub fn dashboard_page(
+    visits: &[VisitDetail],
+    upcoming: &[VisitDetail],
+    graph_connected: bool,
+) -> String {
     let total = visits.len();
     let checked_in = visits.iter().filter(|v| v.status == "checked_in").count();
     let pending = visits.iter().filter(|v| v.status == "pending").count();
     let walk_ins = visits.iter().filter(|v| !v.pre_registered).count();
+
+    let calendar_badge = if graph_connected {
+        r#"<span style="color:var(--green);font-weight:600;">Connected</span>"#
+    } else {
+        r#"<span style="color:var(--text-dim);">Disabled</span>"#
+    };
 
     let stats = format!(r##"
         <div class="stats">
@@ -645,8 +885,21 @@ pub fn dashboard_page(visits: &[VisitDetail], upcoming: &[VisitDetail]) -> Strin
             <div class="stat"><div class="label">Currently On-Site</div><div class="value" style="color:var(--green)">{checked_in}</div></div>
             <div class="stat"><div class="label">Expected</div><div class="value" style="color:var(--text-dim)">{pending}</div></div>
             <div class="stat"><div class="label">Walk-Ins</div><div class="value" style="color:var(--orange)">{walk_ins}</div></div>
+            <div class="stat"><div class="label">Calendar</div><div class="value" style="font-size:0.95rem;">{calendar_badge}</div></div>
         </div>
     "##);
+
+    let checkout_all_btn = if checked_in > 0 {
+        r##"<button class="btn" style="background:var(--orange);color:#fff;font-size:0.85rem;padding:0.4rem 1rem;margin-left:1rem;"
+                    hx-post="/api/visits/checkout-all"
+                    hx-target="#today-table"
+                    hx-swap="innerHTML"
+                    hx-confirm="Check out all on-site visitors?">
+                Check Out All
+            </button>"##
+    } else {
+        ""
+    };
 
     let today_rows = render_visit_rows(visits, true);
     let upcoming_rows = render_visit_rows(upcoming, false);
@@ -655,7 +908,7 @@ pub fn dashboard_page(visits: &[VisitDetail], upcoming: &[VisitDetail]) -> Strin
         <h2>Dashboard</h2>
         {stats}
         <div class="card">
-            <h3>Today's Activity</h3>
+            <h3 style="display:inline-block;">Today's Activity</h3>{checkout_all_btn}
             <div id="today-table" hx-get="/api/dashboard/today" hx-trigger="every 30s" hx-swap="innerHTML">
                 {today_rows}
             </div>
@@ -1449,6 +1702,23 @@ body {{
             min-height:100vh; background:#e5e7eb; }}
     body {{ border: 2px solid #ccc; }}
 }}
+/* Print: force pure black only — no grays that trigger color ink mixing */
+@media print {{
+    html {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+    body, .name, .company, .details, .details .label, .details .value,
+    .badge-lower, .badge-footer, .badge-footer span,
+    .badge-footer .expiry, .escort, .photo-placeholder {{
+        color: #000 !important;
+    }}
+    .company {{ opacity: 0.7; }}
+    .details .value {{ opacity: 0.8; }}
+    .badge-footer {{ background: #fff !important; border-top: 1px solid #000 !important; }}
+    .badge-footer span, .badge-footer .expiry {{ color: #000 !important; }}
+    .escort {{ background: #fff !important; border: 2px solid #000 !important; }}
+    .photo-placeholder {{ border-color: #000 !important; }}
+    .details {{ border-top-color: #000 !important; }}
+    .badge-lower .details {{ border-top-color: #000 !important; }}
+}}
 </style>
 </head>
 <body>
@@ -1478,10 +1748,10 @@ body {{
     <span>Visit: {visit_id} | {date}{badge_footer}</span>
     <span class="expiry">{expiry}</span>
 </div>
-<script>window.onload = function() {{ {auto_print} }}</script>
+<script>{auto_print_script}</script>
 </body>
 </html>"#,
-        auto_print = if preview_only { "" } else { "window.print();" },
+        auto_print_script = if preview_only { "" } else { QUANTIZE_PRINT_JS },
         primary_color = primary_color,
         label_color = label_color,
         font_name = opts.font_name_pt,
@@ -1963,6 +2233,473 @@ pub fn admin_page(
     layout("Admin", &content)
 }
 
+// ── Group Visit ───────────────────────────────────────────────
+
+/// Group visit registration form
+pub fn group_visit_page(hosts: &[Host], purposes: &str, areas: &str, visitor_types: &str) -> String {
+    let host_options = hosts_to_options(hosts);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let purpose_buttons = build_purpose_buttons(purposes);
+    let area_options = build_area_options(areas);
+    let type_options = build_visitor_type_options(visitor_types);
+    let content = format!(r##"
+        <h2>Register Group Visit</h2>
+        <div class="alert" style="background:rgba(79,140,255,0.1);color:var(--accent);border:1px solid rgba(79,140,255,0.3);">
+            For tours, school groups, or large parties. Prints numbered badges for all members.
+        </div>
+        <div class="card">
+            <form id="group-form" hx-post="/api/group-visit" hx-target="#form-result" hx-swap="innerHTML">
+                <div id="form-result"></div>
+
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label>Group Name *</label>
+                        <input type="text" name="group_name" required autofocus
+                               placeholder="e.g., Lincoln Elementary 3rd Grade"
+                               style="font-size:1.1rem;padding:0.75rem;">
+                    </div>
+                    <div class="form-group">
+                        <label>Group Size *</label>
+                        <input type="number" name="group_size" required min="2" max="200" value="10"
+                               style="font-size:1.1rem;padding:0.75rem;">
+                    </div>
+                </div>
+
+                <div class="form-group" style="position:relative;">
+                    <label>Host / Escort *</label>
+                    <input type="text" id="host-search" placeholder="Start typing host name..."
+                           autocomplete="off" style="font-size:1.1rem;padding:0.75rem;">
+                    <input type="hidden" name="host_id" id="host-id" required>
+                    <div id="host-dropdown" class="typeahead-dropdown" style="display:none;"></div>
+                </div>
+
+                <div class="form-group">
+                    <label>Purpose *</label>
+                    <div class="quick-purposes">
+                        {purpose_buttons}
+                    </div>
+                    <input type="text" name="purpose" id="purpose-input" required
+                           placeholder="Or type a custom purpose..." style="margin-top:0.5rem;">
+                </div>
+
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label>Visitor Type</label>
+                        <select name="visitor_type">
+                            {type_options}
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Areas</label>
+                        <select name="areas_requested">
+                            {area_options}
+                        </select>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>When?</label>
+                    <div class="when-row">
+                        <div class="when-field">
+                            <label class="sub-label">Date</label>
+                            <input type="date" name="expected_date" required value="{today}">
+                        </div>
+                        <div class="when-field">
+                            <label class="sub-label">Arrival</label>
+                            <input type="time" name="expected_time" value="09:00">
+                        </div>
+                        <div class="when-field">
+                            <label class="sub-label">Duration</label>
+                            <select name="duration">
+                                <option value="60">1 hour</option>
+                                <option value="90">1.5 hours</option>
+                                <option value="120" selected>2 hours</option>
+                                <option value="180">3 hours</option>
+                                <option value="240">Half day</option>
+                                <option value="480">Full day</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="form-group full">
+                    <label>Special Notes</label>
+                    <textarea name="special_notes" rows="2"
+                              placeholder="Chaperone info, parking needs, special accommodations..."
+                              style="width:100%;resize:vertical;"></textarea>
+                </div>
+
+                <div style="margin-top:1.25rem;">
+                    <button type="submit" class="btn btn-primary" style="font-size:1.1rem;padding:0.75rem 2rem;">
+                        Register Group
+                        <span class="htmx-indicator"><span class="spinner"></span></span>
+                    </button>
+                </div>
+            </form>
+        </div>
+
+        <style>
+            .quick-purposes {{
+                display: flex; flex-wrap: wrap; gap: 0.5rem;
+            }}
+            .purpose-btn {{
+                padding: 0.5rem 1rem;
+                border-radius: 20px;
+                border: 1px solid var(--border);
+                background: var(--surface2);
+                color: var(--text);
+                cursor: pointer;
+                font-size: 0.9rem;
+                transition: all 0.15s;
+            }}
+            .purpose-btn:hover {{ border-color: var(--accent); color: var(--accent); }}
+            .purpose-btn.selected {{
+                background: var(--accent);
+                color: #fff;
+                border-color: var(--accent);
+            }}
+            .typeahead-dropdown {{
+                position: absolute;
+                top: 100%;
+                left: 0; right: 0;
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: 0 0 8px 8px;
+                max-height: 220px;
+                overflow-y: auto;
+                z-index: 100;
+                box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+            }}
+            .typeahead-item {{
+                padding: 0.65rem 0.75rem;
+                cursor: pointer;
+                border-bottom: 1px solid var(--border);
+                font-size: 0.9rem;
+            }}
+            .typeahead-item:hover {{ background: var(--surface2); }}
+            .typeahead-item .sub {{ color: var(--text-dim); font-size: 0.8rem; }}
+            .when-row {{
+                display: grid;
+                grid-template-columns: 1fr 1fr 1fr;
+                gap: 0.75rem;
+                margin-top: 0.5rem;
+            }}
+            .when-field label.sub-label {{
+                font-size: 0.75rem;
+                color: var(--text-dim);
+                margin-bottom: 0.25rem;
+            }}
+            @media (max-width: 768px) {{
+                .when-row {{ grid-template-columns: 1fr; }}
+            }}
+        </style>
+
+        <script>
+        // ── Host typeahead ──
+        let hostTimer = null;
+        const hostInput = document.getElementById('host-search');
+        const hostDrop = document.getElementById('host-dropdown');
+        const hostIdInput = document.getElementById('host-id');
+
+        hostInput.addEventListener('focus', function() {{
+            if (!this.value.trim()) fetchHosts('');
+        }});
+
+        hostInput.addEventListener('input', function() {{
+            clearTimeout(hostTimer);
+            hostIdInput.value = '';
+            hostTimer = setTimeout(() => fetchHosts(this.value.trim()), 150);
+        }});
+
+        function fetchHosts(q) {{
+            fetch('/api/hosts/search?q=' + encodeURIComponent(q))
+                .then(r => r.json())
+                .then(results => {{
+                    if (results.length === 0) {{ hostDrop.style.display = 'none'; return; }}
+                    hostDrop.innerHTML = results.map(h =>
+                        `<div class="typeahead-item" onclick="pickHost(this)"
+                              data-id="${{h.id}}" data-name="${{h.name}}" data-dept="${{h.department}}">
+                            <div>${{h.name}}</div>
+                            <div class="sub">${{h.department}}</div>
+                        </div>`
+                    ).join('');
+                    hostDrop.style.display = 'block';
+                }});
+        }}
+
+        function pickHost(el) {{
+            hostInput.value = el.dataset.name + ' — ' + el.dataset.dept;
+            hostIdInput.value = el.dataset.id;
+            hostDrop.style.display = 'none';
+        }}
+
+        function pickPurpose(btn) {{
+            document.querySelectorAll('.purpose-btn').forEach(b => b.classList.remove('selected'));
+            btn.classList.add('selected');
+            document.getElementById('purpose-input').value = btn.textContent;
+        }}
+
+        document.addEventListener('click', function(e) {{
+            if (!e.target.closest('#host-search') && !e.target.closest('#host-dropdown'))
+                hostDrop.style.display = 'none';
+        }});
+
+        document.getElementById('group-form').addEventListener('htmx:configRequest', function(e) {{
+            if (!hostIdInput.value) {{
+                e.preventDefault();
+                hostInput.focus();
+                hostInput.style.borderColor = 'var(--red)';
+                setTimeout(() => hostInput.style.borderColor = '', 2000);
+            }}
+        }});
+        </script>
+    "##, today = today);
+
+    layout("Group Visit", &content)
+}
+
+/// Multi-badge page for group visits — renders N badges, one per page
+pub fn group_badge_page(
+    v: &VisitDetail,
+    opts: &BadgeOpts,
+    group_size: i32,
+) -> String {
+    let company_name = opts.company_name;
+    let expiry_text = opts.expiry_text;
+    let primary_color = opts.primary_color;
+    let label_color = if opts.badge_label_color == "primary" || opts.badge_label_color.is_empty() {
+        primary_color
+    } else {
+        opts.badge_label_color
+    };
+    let badge_label = "GROUP";
+    let group_name = v.group_name.as_deref().unwrap_or(&v.visitor.name);
+    let areas = v.areas_requested.as_deref().unwrap_or("General");
+    let badge_num = v.badge_number.as_deref().unwrap_or("—");
+    let date_raw = v.expected_date.as_deref()
+        .or(v.check_in.as_deref())
+        .unwrap_or(&v.created_at);
+    let date = chrono::NaiveDate::parse_from_str(
+        &date_raw.chars().take(10).collect::<String>(), "%Y-%m-%d"
+    )
+        .map(|d| d.format("%B %-d, %Y").to_string())
+        .unwrap_or_else(|_| date_raw.to_string());
+    let checkin_time = v.check_in.as_deref().unwrap_or("—");
+    let visit_id_short = if v.id.len() >= 8 { &v.id[..8] } else { &v.id };
+    let escort = if opts.show_escort && areas != "General" && areas != "Lobby" && areas != "Main Lobby" {
+        "ESCORT REQUIRED"
+    } else {
+        ""
+    };
+
+    let logo_html = match opts.logo_filename {
+        Some(f) => format!(
+            r#"<img src="/photos/{}" alt="" style="height:18px;margin-right:6px;vertical-align:middle;">"#,
+            f
+        ),
+        None => String::new(),
+    };
+
+    let footer_extra = if opts.footer_text.is_empty() {
+        String::new()
+    } else {
+        format!(" | {}", opts.footer_text)
+    };
+
+    // Build detail rows
+    let mut upper_rows = String::new();
+    upper_rows.push_str(&format!(
+        r#"<tr><td class="label">Host:</td><td class="value">{} ({})</td></tr>"#,
+        v.host.name, v.host.department
+    ));
+    if opts.show_purpose {
+        upper_rows.push_str(&format!(
+            r#"<tr><td class="label">Purpose:</td><td class="value">{}</td></tr>"#,
+            v.purpose
+        ));
+    }
+    if opts.show_areas {
+        upper_rows.push_str(&format!(
+            r#"<tr><td class="label">Areas:</td><td class="value">{}</td></tr>"#,
+            areas
+        ));
+    }
+
+    let mut lower_rows = String::new();
+    lower_rows.push_str(&format!(
+        r#"<tr><td class="label">Checked In:</td><td class="value">{}</td></tr>"#,
+        checkin_time
+    ));
+    if opts.show_badge_number {
+        lower_rows.push_str(&format!(
+            r#"<tr><td class="label">Badge #:</td><td class="value">{}</td></tr>"#,
+            badge_num
+        ));
+    }
+
+    let escort_html = if !escort.is_empty() {
+        format!(r#"<div class="escort">{}</div>"#, escort)
+    } else {
+        String::new()
+    };
+
+    // Generate all badge divs
+    let mut badges = String::new();
+    for i in 1..=group_size {
+        let page_break = if i < group_size { "page-break-after: always;" } else { "" };
+        badges.push_str(&format!(
+            r#"<div class="badge-sheet" style="{page_break}">
+<div class="banner">
+    <span class="org">{logo}{company}</span>
+    <span class="type">{badge_label}</span>
+</div>
+<div class="badge-content">
+    <div class="badge-upper">
+        <div class="info-col" style="flex:1;">
+            <div class="name">{group_name}</div>
+            <div class="company">Member {i} of {total}</div>
+            <table class="details">
+                {upper_rows}
+            </table>
+        </div>
+    </div>
+    {escort}
+    <div class="badge-lower">
+        <table class="details">
+            {lower_rows}
+        </table>
+    </div>
+</div>
+<div class="badge-footer">
+    <span>Visit: {visit_id} | {date}{footer}</span>
+    <span class="expiry">{expiry}</span>
+</div>
+</div>"#,
+            page_break = page_break,
+            logo = logo_html,
+            company = company_name,
+            badge_label = badge_label,
+            group_name = group_name,
+            i = i,
+            total = group_size,
+            upper_rows = upper_rows,
+            escort = escort_html,
+            lower_rows = lower_rows,
+            visit_id = visit_id_short,
+            date = date,
+            footer = footer_extra,
+            expiry = expiry_text,
+        ));
+    }
+
+    format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Group Badges — {group_name} ({total} members)</title>
+<style>
+@page {{ size: 4in 2.4in; margin: 0; }}
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    padding: 0;
+}}
+.badge-sheet {{
+    width: 4in; height: 2.4in;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+}}
+.banner {{
+    background: {primary_color}; color: #fff;
+    padding: 4px 12px;
+    display: flex; justify-content: space-between; align-items: center;
+}}
+.banner .org {{ font-size: 11pt; font-weight: 700; letter-spacing: 1px; }}
+.banner .type {{ font-size: 14pt; font-weight: 800; text-transform: uppercase;
+    background: #fff; color: {label_color}; padding: 2px 14px; border-radius: 4px;
+    border: 2px solid #fff; letter-spacing: 1px; }}
+.badge-content {{ flex: 1; display: flex; flex-direction: column; overflow: hidden; }}
+.badge-upper {{
+    display: flex; padding: 0.06in 0.15in 0; gap: 0.1in;
+}}
+.info-col {{
+    flex: 1;
+    display: flex; flex-direction: column;
+    justify-content: flex-start;
+    overflow: hidden;
+}}
+.name {{ font-size: {font_name}pt; font-weight: 700; line-height: 1.0;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: {spacing}px; }}
+.company {{ font-size: {font_company}pt; color: #666; margin-bottom: {spacing}px; font-weight: 600; }}
+.details {{ font-size: {font_detail}pt; width: 100%; border-top: 1px solid #ddd; padding-top: {spacing}px;
+    border-collapse: collapse; }}
+.details tr td {{ padding: {half_spacing}px 0; vertical-align: top; line-height: 1.2; }}
+.details .label {{ font-weight: 600; color: #333; text-align: right; white-space: nowrap;
+    padding-right: 6px; width: 1px; }}
+.details .value {{ color: #555; }}
+.badge-lower {{
+    padding: 0 0.15in 0.04in;
+    font-size: {font_detail}pt;
+}}
+.badge-lower .details {{ border-top: 1px solid #ddd; }}
+.escort {{
+    margin: 2px 0.15in; padding: 2px 6px;
+    background: #fee2e2; color: #dc2626;
+    font-size: 8pt; font-weight: 700;
+    border-radius: 3px; display: inline-block;
+    text-transform: uppercase;
+}}
+.badge-footer {{
+    background: #f3f4f6;
+    border-top: 1px solid #ddd;
+    padding: 2px 10px;
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 7pt; color: #666;
+}}
+.badge-footer .expiry {{
+    font-weight: 700; color: #dc2626; text-transform: uppercase;
+}}
+@media screen {{
+    body {{ background:#e5e7eb; display:flex; flex-direction:column; align-items:center; gap:1rem; padding:1rem; }}
+    .badge-sheet {{ border: 2px solid #ccc; }}
+}}
+@media print {{
+    html {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+    body, .name, .company, .details, .details .label, .details .value,
+    .badge-lower, .badge-footer, .badge-footer span,
+    .badge-footer .expiry, .escort {{
+        color: #000 !important;
+    }}
+    .company {{ opacity: 0.7; }}
+    .details .value {{ opacity: 0.8; }}
+    .badge-footer {{ background: #fff !important; border-top: 1px solid #000 !important; }}
+    .badge-footer span, .badge-footer .expiry {{ color: #000 !important; }}
+    .escort {{ background: #fff !important; border: 2px solid #000 !important; }}
+    .details {{ border-top-color: #000 !important; }}
+    .badge-lower .details {{ border-top-color: #000 !important; }}
+}}
+</style>
+</head>
+<body>
+{badges}
+<script>{quantize_script}</script>
+</body>
+</html>"#,
+        quantize_script = QUANTIZE_GROUP_PRINT_JS,
+        group_name = group_name,
+        total = group_size,
+        primary_color = primary_color,
+        label_color = label_color,
+        font_name = opts.font_name_pt,
+        font_company = opts.font_company_pt,
+        font_detail = opts.font_detail_pt,
+        spacing = opts.line_spacing,
+        half_spacing = opts.line_spacing / 2,
+        badges = badges,
+    )
+}
+
 // ── Helpers ────────────────────────────────────────────────────
 
 fn render_visit_rows(visits: &[VisitDetail], show_actions: bool) -> String {
@@ -1982,11 +2719,25 @@ fn render_visit_rows(visits: &[VisitDetail], show_actions: bool) -> String {
             _ => ("pending", v.status.as_str()),
         };
 
-        let prereg_badge = if !v.pre_registered {
-            r##" <span class="badge walk_in">WALK-IN</span>"##
-        } else { "" };
+        let type_badge = if v.is_group {
+            let size = v.group_size.unwrap_or(0);
+            format!(r##" <span class="badge" style="background:rgba(79,140,255,0.15);color:var(--accent);">GROUP ({})</span>"##, size)
+        } else if !v.pre_registered {
+            r##" <span class="badge walk_in">WALK-IN</span>"##.to_string()
+        } else {
+            String::new()
+        };
 
-        let company = v.visitor.company.as_deref().unwrap_or("—");
+        let display_name = if v.is_group {
+            v.group_name.as_deref().unwrap_or(&v.visitor.name)
+        } else {
+            &v.visitor.name
+        };
+        let company = if v.is_group {
+            "—"
+        } else {
+            v.visitor.company.as_deref().unwrap_or("—")
+        };
         let expected_time = format_expected(v.expected_date.as_deref(), v.expected_time.as_deref());
         let checkin_time = v.check_in.as_deref().unwrap_or("—");
         let checkout_time = v.check_out.as_deref().unwrap_or("—");
@@ -1996,7 +2747,7 @@ fn render_visit_rows(visits: &[VisitDetail], show_actions: bool) -> String {
         } else { String::new() };
 
         format!(r##"<tr>
-            <td>{name}{prereg_badge}</td>
+            <td>{name}{type_badge}</td>
             <td>{company}</td>
             <td>{host}</td>
             <td>{purpose}</td>
@@ -2006,8 +2757,8 @@ fn render_visit_rows(visits: &[VisitDetail], show_actions: bool) -> String {
             <td>{checkout}</td>
             {actions}
         </tr>"##,
-            name = v.visitor.name,
-            prereg_badge = prereg_badge,
+            name = display_name,
+            type_badge = type_badge,
             company = company,
             host = v.host.name,
             purpose = v.purpose,
@@ -2096,10 +2847,20 @@ pub fn visit_row_partial(v: &VisitDetail) -> String {
         "rescheduled" => ("rescheduled", "RESCHEDULED"),
         _ => ("pending", v.status.as_str()),
     };
-    let prereg_badge = if !v.pre_registered {
-        r##" <span class="badge walk_in">WALK-IN</span>"##
-    } else { "" };
-    let company = v.visitor.company.as_deref().unwrap_or("—");
+    let type_badge = if v.is_group {
+        let size = v.group_size.unwrap_or(0);
+        format!(r##" <span class="badge" style="background:rgba(79,140,255,0.15);color:var(--accent);">GROUP ({})</span>"##, size)
+    } else if !v.pre_registered {
+        r##" <span class="badge walk_in">WALK-IN</span>"##.to_string()
+    } else {
+        String::new()
+    };
+    let display_name = if v.is_group {
+        v.group_name.as_deref().unwrap_or(&v.visitor.name)
+    } else {
+        &v.visitor.name
+    };
+    let company = if v.is_group { "—" } else { v.visitor.company.as_deref().unwrap_or("—") };
     let expected_time = format_expected(v.expected_date.as_deref(), v.expected_time.as_deref());
     let checkin_time = v.check_in.as_deref().unwrap_or("—");
     let checkout_time = v.check_out.as_deref().unwrap_or("—");
@@ -2107,12 +2868,12 @@ pub fn visit_row_partial(v: &VisitDetail) -> String {
     let actions = visit_action_buttons(v);
 
     format!(r##"<tr>
-        <td>{name}{prereg}</td><td>{company}</td><td>{host}</td><td>{purpose}</td>
+        <td>{name}{type_badge}</td><td>{company}</td><td>{host}</td><td>{purpose}</td>
         <td>{expected}</td>
         <td><span class="badge {status_class}">{status_label}</span></td>
         <td>{checkin}</td><td>{checkout}</td>{actions}
     </tr>"##,
-        name = v.visitor.name, prereg = prereg_badge, company = company,
+        name = display_name, type_badge = type_badge, company = company,
         host = v.host.name, purpose = v.purpose, expected = expected_time,
         status_class = status_class, status_label = status_label,
         checkin = checkin_time, checkout = checkout_time, actions = actions
@@ -2122,30 +2883,55 @@ pub fn visit_row_partial(v: &VisitDetail) -> String {
 /// Generate action buttons based on visit status
 fn visit_action_buttons(v: &VisitDetail) -> String {
     match v.status.as_str() {
-        "pending" | "running_late" => format!(
-            r##"<td class="actions">
-                <button class="btn btn-success btn-sm" onclick="openCamera('{id}','{name}',this)">On Site</button>
-                <select class="btn btn-muted btn-sm" style="cursor:pointer;" onchange="if(this.value){{markLate('{id}',this.value,this);this.value='';}}">
-                    <option value="">Delayed</option>
-                    <option value="5">~5 min</option>
-                    <option value="10">~10 min</option>
-                    <option value="15">~15 min</option>
-                    <option value="20">~20 min</option>
-                    <option value="25">~25 min</option>
-                    <option value="30">~30 min</option>
-                    <option value="35">~35 min</option>
-                    <option value="40">~40 min</option>
-                    <option value="45">~45 min</option>
-                </select>
-                <button class="btn btn-primary btn-sm" onclick="openReschedule('{id}',this)">Reschedule</button>
-            </td>"##,
-            id = v.id,
-            name = v.visitor.name.replace('\'', "\\'"),
-        ),
-        "checked_in" => format!(
-            r##"<td class="actions"><button class="btn btn-ghost btn-sm" hx-post="/api/visits/{}/checkout" hx-swap="outerHTML" hx-target="closest tr">Check Out</button></td>"##,
-            v.id
-        ),
+        "pending" | "running_late" => {
+            let checkin_button = if v.is_group {
+                let size = v.group_size.unwrap_or(0);
+                format!(
+                    r##"<button class="btn btn-success btn-sm" onclick="if(!confirm('Check in group of {size}? This will print {size} badges.'))return;checkInGroup('{id}',this)">Check In Group ({size})</button>"##,
+                    id = v.id, size = size
+                )
+            } else {
+                format!(
+                    r##"<button class="btn btn-success btn-sm" onclick="openCamera('{id}','{name}',this)">On Site</button>"##,
+                    id = v.id,
+                    name = v.visitor.name.replace('\'', "\\'"),
+                )
+            };
+            format!(
+                r##"<td class="actions">
+                    {checkin_button}
+                    <select class="btn btn-muted btn-sm" style="cursor:pointer;" onchange="if(this.value){{markLate('{id}',this.value,this);this.value='';}}">
+                        <option value="">Delayed</option>
+                        <option value="5">~5 min</option>
+                        <option value="10">~10 min</option>
+                        <option value="15">~15 min</option>
+                        <option value="20">~20 min</option>
+                        <option value="25">~25 min</option>
+                        <option value="30">~30 min</option>
+                        <option value="35">~35 min</option>
+                        <option value="40">~40 min</option>
+                        <option value="45">~45 min</option>
+                    </select>
+                    <button class="btn btn-primary btn-sm" onclick="openReschedule('{id}',this)">Reschedule</button>
+                </td>"##,
+                checkin_button = checkin_button,
+                id = v.id,
+            )
+        },
+        "checked_in" => {
+            if v.is_group {
+                let size = v.group_size.unwrap_or(0);
+                format!(
+                    r##"<td class="actions"><button class="btn btn-ghost btn-sm" hx-post="/api/visits/{id}/checkout" hx-swap="outerHTML" hx-target="closest tr" hx-confirm="Check out all {size} members of this group?">Check Out Group</button></td>"##,
+                    id = v.id, size = size
+                )
+            } else {
+                format!(
+                    r##"<td class="actions"><button class="btn btn-ghost btn-sm" hx-post="/api/visits/{id}/checkout" hx-swap="outerHTML" hx-target="closest tr">Check Out</button></td>"##,
+                    id = v.id
+                )
+            }
+        },
         _ => "<td>—</td>".to_string(),
     }
 }
