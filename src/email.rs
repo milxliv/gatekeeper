@@ -170,6 +170,7 @@ async fn get_graph_token(_db: &DbPool) -> Result<String> {
 // ── Email content builders ────────────────────────────────────
 
 fn host_arrival_email(visit: &VisitDetail) -> (String, String) {
+    use crate::templates::html_escape;
     let company = visit.visitor.company.as_deref().unwrap_or("—");
     let areas = visit.areas_requested.as_deref().unwrap_or("Lobby");
 
@@ -194,16 +195,17 @@ fn host_arrival_email(visit: &VisitDetail) -> (String, String) {
 </table>
 <p style="color:#666;">Please proceed to reception to meet your visitor.</p>
 </div>"#,
-        name = visit.visitor.name,
-        company = company,
-        purpose = visit.purpose,
-        areas = areas,
+        name = html_escape(&visit.visitor.name),
+        company = html_escape(company),
+        purpose = html_escape(&visit.purpose),
+        areas = html_escape(areas),
     );
 
     (subject, body)
 }
 
 fn visitor_confirmation_email(visit: &VisitDetail) -> (String, String) {
+    use crate::templates::html_escape;
     let date = visit.expected_date.as_deref().unwrap_or("TBD");
     let areas = visit.areas_requested.as_deref().unwrap_or("Lobby");
 
@@ -226,17 +228,18 @@ fn visitor_confirmation_email(visit: &VisitDetail) -> (String, String) {
 <p>Please check in at reception upon arrival. Bring a valid government-issued photo ID.</p>
 <p style="color:#666;font-size:12px;">This is an automated message.</p>
 </div>"#,
-        date = date,
-        host = visit.host.name,
-        dept = visit.host.department,
-        purpose = visit.purpose,
-        areas = areas,
+        date = html_escape(date),
+        host = html_escape(&visit.host.name),
+        dept = html_escape(&visit.host.department),
+        purpose = html_escape(&visit.purpose),
+        areas = html_escape(areas),
     );
 
     (subject, body)
 }
 
 fn receptionist_email(visit: &VisitDetail, is_walk_in: bool) -> (String, String) {
+    use crate::templates::html_escape;
     let visit_type = if is_walk_in { "Walk-In" } else { "Pre-Registration" };
     let company = visit.visitor.company.as_deref().unwrap_or("—");
     let date = visit.expected_date.as_deref().unwrap_or("Today");
@@ -266,12 +269,12 @@ fn receptionist_email(visit: &VisitDetail, is_walk_in: bool) -> (String, String)
 </table>
 </div>"#,
         visit_type = visit_type,
-        name = visit.visitor.name,
-        company = company,
-        host = visit.host.name,
-        date = date,
-        purpose = visit.purpose,
-        areas = areas,
+        name = html_escape(&visit.visitor.name),
+        company = html_escape(company),
+        host = html_escape(&visit.host.name),
+        date = html_escape(date),
+        purpose = html_escape(&visit.purpose),
+        areas = html_escape(areas),
     );
 
     (subject, body)

@@ -1,6 +1,15 @@
 use crate::models::*;
 use std::cell::RefCell;
 
+/// Escape HTML special characters to prevent XSS
+pub fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 /// Pixel-quantization script for 2-color thermal printers (Brother QL-820NWB).
 ///
 /// The printer has separate black and red thermal heads. Any pixel that isn't
@@ -1338,24 +1347,30 @@ pub fn hosts_page(hosts: &[Host]) -> String {
     let host_rows: String = hosts.iter().map(|h| {
         let phone = h.phone.as_deref().unwrap_or("");
         let phone_display = if phone.is_empty() { "—" } else { phone };
+        // Escape for HTML content and JS string contexts
+        let name_html = html_escape(&h.name);
+        let dept_html = html_escape(&h.department);
+        let email_html = html_escape(&h.email);
+        let phone_html = html_escape(phone_display);
+        // For JS string literals inside onclick, escape both HTML and JS
+        let js_escape = |s: &str| html_escape(&s.replace('\\', "\\\\").replace('\'', "\\'"));
+        let name_js = js_escape(&h.name);
+        let dept_js = js_escape(&h.department);
+        let email_js = js_escape(&h.email);
+        let phone_js = js_escape(phone);
         format!(r##"<tr id="host-row-{id}">
-            <td>{name}</td>
-            <td>{dept}</td>
-            <td>{email}</td>
-            <td>{phone_display}</td>
+            <td>{name_html}</td>
+            <td>{dept_html}</td>
+            <td>{email_html}</td>
+            <td>{phone_html}</td>
             <td class="actions">
-                <button class="btn btn-ghost btn-sm" onclick="editHost('{id}','{name}','{dept}','{email}','{phone}')">Edit</button>
+                <button class="btn btn-ghost btn-sm" onclick="editHost('{id}','{name_js}','{dept_js}','{email_js}','{phone_js}')">Edit</button>
                 <button class="btn btn-danger btn-sm"
                         hx-delete="/api/hosts/{id}" hx-target="#host-row-{id}" hx-swap="outerHTML"
-                        hx-confirm="Remove {name}? They won't receive visitor notifications anymore.">Remove</button>
+                        hx-confirm="Remove {name_html}? They won&#x27;t receive visitor notifications anymore.">Remove</button>
             </td>
         </tr>"##,
             id = h.id,
-            name = h.name.replace('\'', "\\'"),
-            dept = h.department.replace('\'', "\\'"),
-            email = h.email.replace('\'', "\\'"),
-            phone = phone.replace('\'', "\\'"),
-            phone_display = phone_display,
         )
     }).collect();
 
@@ -1540,7 +1555,7 @@ fn badge_page_inner(
     } else {
         &v.visitor_type
     };
-    let visitor_company = v.visitor.company.as_deref().unwrap_or("");
+    let visitor_company = html_escape(v.visitor.company.as_deref().unwrap_or(""));
     let areas = v.areas_requested.as_deref().unwrap_or("General");
     let badge_num = v.badge_number.as_deref().unwrap_or("—");
     let date_raw = v.expected_date.as_deref()
@@ -1576,18 +1591,18 @@ fn badge_page_inner(
     let mut upper_rows = String::new();
     upper_rows.push_str(&format!(
         r#"<tr><td class="label">Host:</td><td class="value">{} ({})</td></tr>"#,
-        v.host.name, v.host.department
+        html_escape(&v.host.name), html_escape(&v.host.department)
     ));
     if opts.show_purpose {
         upper_rows.push_str(&format!(
             r#"<tr><td class="label">Purpose:</td><td class="value">{}</td></tr>"#,
-            v.purpose
+            html_escape(&v.purpose)
         ));
     }
     if opts.show_areas {
         upper_rows.push_str(&format!(
             r#"<tr><td class="label">Areas:</td><td class="value">{}</td></tr>"#,
-            areas
+            html_escape(areas)
         ));
     }
 
@@ -1758,7 +1773,7 @@ body {{
         font_detail = opts.font_detail_pt,
         spacing = opts.line_spacing,
         half_spacing = opts.line_spacing / 2,
-        company_name = company_name,
+        company_name = html_escape(company_name),
         logo_html = match logo_filename {
             Some(f) => format!(
                 r#"<img src="/photos/{}" alt="" style="height:18px;margin-right:6px;vertical-align:middle;">"#,
@@ -1767,7 +1782,7 @@ body {{
             None => String::new(),
         },
         photo = photo_html,
-        name = v.visitor.name,
+        name = html_escape(&v.visitor.name),
         visitor_company = visitor_company,
         upper_rows = upper_rows,
         lower_rows = lower_rows,
@@ -2471,7 +2486,7 @@ pub fn group_badge_page(
         opts.badge_label_color
     };
     let badge_label = "GROUP";
-    let group_name = v.group_name.as_deref().unwrap_or(&v.visitor.name);
+    let group_name = html_escape(v.group_name.as_deref().unwrap_or(&v.visitor.name));
     let areas = v.areas_requested.as_deref().unwrap_or("General");
     let badge_num = v.badge_number.as_deref().unwrap_or("—");
     let date_raw = v.expected_date.as_deref()
@@ -2508,18 +2523,18 @@ pub fn group_badge_page(
     let mut upper_rows = String::new();
     upper_rows.push_str(&format!(
         r#"<tr><td class="label">Host:</td><td class="value">{} ({})</td></tr>"#,
-        v.host.name, v.host.department
+        html_escape(&v.host.name), html_escape(&v.host.department)
     ));
     if opts.show_purpose {
         upper_rows.push_str(&format!(
             r#"<tr><td class="label">Purpose:</td><td class="value">{}</td></tr>"#,
-            v.purpose
+            html_escape(&v.purpose)
         ));
     }
     if opts.show_areas {
         upper_rows.push_str(&format!(
             r#"<tr><td class="label">Areas:</td><td class="value">{}</td></tr>"#,
-            areas
+            html_escape(areas)
         ));
     }
 
@@ -2575,7 +2590,7 @@ pub fn group_badge_page(
 </div>"#,
             page_break = page_break,
             logo = logo_html,
-            company = company_name,
+            company = html_escape(company_name),
             badge_label = badge_label,
             group_name = group_name,
             i = i,
@@ -2726,16 +2741,16 @@ fn render_visit_rows(visits: &[VisitDetail], show_actions: bool) -> String {
             String::new()
         };
 
-        let display_name = if v.is_group {
+        let display_name = html_escape(if v.is_group {
             v.group_name.as_deref().unwrap_or(&v.visitor.name)
         } else {
             &v.visitor.name
-        };
-        let company = if v.is_group {
+        });
+        let company = html_escape(if v.is_group {
             "—"
         } else {
             v.visitor.company.as_deref().unwrap_or("—")
-        };
+        });
         let expected_time = format_expected(v.expected_date.as_deref(), v.expected_time.as_deref());
         let checkin_time = v.check_in.as_deref().unwrap_or("—");
         let checkout_time = v.check_out.as_deref().unwrap_or("—");
@@ -2758,8 +2773,8 @@ fn render_visit_rows(visits: &[VisitDetail], show_actions: bool) -> String {
             name = display_name,
             type_badge = type_badge,
             company = company,
-            host = v.host.name,
-            purpose = v.purpose,
+            host = html_escape(&v.host.name),
+            purpose = html_escape(&v.purpose),
             expected = expected_time,
             status_class = status_class,
             status = status_label,
@@ -2821,18 +2836,21 @@ fn format_time_12h(time: Option<&str>) -> String {
 
 fn hosts_to_options(hosts: &[Host]) -> String {
     hosts.iter().map(|h| {
-        format!(r##"<option value="{}">{} — {}</option>"##, h.id, h.name, h.department)
+        format!(
+            r##"<option value="{}">{} — {}</option>"##,
+            html_escape(&h.id), html_escape(&h.name), html_escape(&h.department)
+        )
     }).collect()
 }
 
-/// HTMX partial: success alert
+/// HTMX partial: success alert (escapes HTML in message)
 pub fn alert_success(msg: &str) -> String {
-    format!(r##"<div class="alert alert-success">{msg}</div>"##)
+    format!(r##"<div class="alert alert-success">{}</div>"##, html_escape(msg))
 }
 
-/// HTMX partial: error alert
+/// HTMX partial: error alert (escapes HTML in message)
 pub fn alert_error(msg: &str) -> String {
-    format!(r##"<div class="alert alert-error">{msg}</div>"##)
+    format!(r##"<div class="alert alert-error">{}</div>"##, html_escape(msg))
 }
 
 /// Render a single updated table row (for HTMX swap after action)
@@ -2853,12 +2871,12 @@ pub fn visit_row_partial(v: &VisitDetail) -> String {
     } else {
         String::new()
     };
-    let display_name = if v.is_group {
+    let display_name = html_escape(if v.is_group {
         v.group_name.as_deref().unwrap_or(&v.visitor.name)
     } else {
         &v.visitor.name
-    };
-    let company = if v.is_group { "—" } else { v.visitor.company.as_deref().unwrap_or("—") };
+    });
+    let company = html_escape(if v.is_group { "—" } else { v.visitor.company.as_deref().unwrap_or("—") });
     let expected_time = format_expected(v.expected_date.as_deref(), v.expected_time.as_deref());
     let checkin_time = v.check_in.as_deref().unwrap_or("—");
     let checkout_time = v.check_out.as_deref().unwrap_or("—");
@@ -2872,7 +2890,8 @@ pub fn visit_row_partial(v: &VisitDetail) -> String {
         <td>{checkin}</td><td>{checkout}</td>{actions}
     </tr>"##,
         name = display_name, type_badge = type_badge, company = company,
-        host = v.host.name, purpose = v.purpose, expected = expected_time,
+        host = html_escape(&v.host.name), purpose = html_escape(&v.purpose),
+        expected = expected_time,
         status_class = status_class, status_label = status_label,
         checkin = checkin_time, checkout = checkout_time, actions = actions
     )
@@ -2892,7 +2911,7 @@ fn visit_action_buttons(v: &VisitDetail) -> String {
                 format!(
                     r##"<button class="btn btn-success btn-sm" onclick="openCamera('{id}','{name}',this)">On Site</button>"##,
                     id = v.id,
-                    name = v.visitor.name.replace('\'', "\\'"),
+                    name = html_escape(&v.visitor.name.replace('\\', "\\\\").replace('\'', "\\'")),
                 )
             };
             format!(
@@ -2941,7 +2960,7 @@ fn build_purpose_buttons(purposes: &str) -> String {
         .filter(|p| !p.is_empty())
         .map(|p| format!(
             r#"<button type="button" class="purpose-btn" onclick="pickPurpose(this)">{}</button>"#,
-            p
+            html_escape(p)
         ))
         .collect::<Vec<_>>()
         .join("\n")
@@ -2952,7 +2971,10 @@ fn build_visitor_type_options(types: &str) -> String {
     types.split(',')
         .map(|t| t.trim())
         .filter(|t| !t.is_empty())
-        .map(|t| format!(r#"<option value="{t}">{t}</option>"#))
+        .map(|t| {
+            let escaped = html_escape(t);
+            format!(r#"<option value="{escaped}">{escaped}</option>"#)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -2961,8 +2983,9 @@ fn build_visitor_type_options(types: &str) -> String {
 fn build_area_options(areas: &str) -> String {
     let mut opts = String::from(r#"<option value="">Lobby only</option>"#);
     for area in areas.split(',').map(|a| a.trim()).filter(|a| !a.is_empty()) {
+        let escaped = html_escape(area);
         opts.push_str(&format!(
-            r#"<option value="{area}">{area}</option>"#
+            r#"<option value="{escaped}">{escaped}</option>"#
         ));
     }
     opts

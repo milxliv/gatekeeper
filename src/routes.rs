@@ -14,6 +14,12 @@ use crate::models::*;
 use crate::templates;
 use crate::AppState;
 
+/// Log internal error details and return a safe user-facing message
+fn safe_error(context: &str, err: impl std::fmt::Display) -> String {
+    tracing::error!("{}: {}", context, err);
+    format!("{} — please try again or contact an administrator.", context)
+}
+
 // ── Auth handlers ─────────────────────────────────────────────
 
 pub async fn page_login(State(state): State<Arc<AppState>>) -> Html<String> {
@@ -66,7 +72,7 @@ pub async fn api_login(
             let token = uuid::Uuid::new_v4().to_string();
             let _ = db::create_session(&state.db, &token, role, 24);
             let cookie = format!(
-                "gk_session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400",
+                "gk_session={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400",
                 token
             );
             (
@@ -333,7 +339,7 @@ pub async fn api_pre_register(
             )))
         }
         Err(e) => {
-            Html(templates::alert_error(&format!("Failed to register: {}", e)))
+            Html(templates::alert_error(&safe_error("Failed to register visitor", e)))
         }
     }
 }
@@ -426,7 +432,7 @@ pub async fn api_walk_in(
             )))
         }
         Err(e) => {
-            Html(templates::alert_error(&format!("Failed to check in: {}", e)))
+            Html(templates::alert_error(&safe_error("Failed to check in", e)))
         }
     }
 }
@@ -473,7 +479,7 @@ pub async fn api_group_visit(
     let visitor_id = match db::find_or_create_visitor(&state.db, &visitor) {
         Ok(id) => id,
         Err(e) => {
-            return Html(templates::alert_error(&format!("Database error: {}", e)));
+            return Html(templates::alert_error(&safe_error("Database error", e)));
         }
     };
 
@@ -511,7 +517,7 @@ pub async fn api_group_visit(
             )))
         }
         Err(e) => {
-            Html(templates::alert_error(&format!("Failed to register group: {}", e)))
+            Html(templates::alert_error(&safe_error("Failed to register group", e)))
         }
     }
 }
@@ -529,7 +535,7 @@ pub async fn api_add_host(
             "{} added as host.",
             form.name
         ))),
-        Err(e) => Html(templates::alert_error(&format!("Failed: {}", e))),
+        Err(e) => Html(templates::alert_error(&safe_error("Operation failed", e))),
     }
 }
 
@@ -546,7 +552,7 @@ pub async fn api_update_host(
         Ok(_) => Html(templates::alert_success(&format!(
             "{} updated.", form.name
         ))),
-        Err(e) => Html(templates::alert_error(&format!("Failed: {}", e))),
+        Err(e) => Html(templates::alert_error(&safe_error("Operation failed", e))),
     }
 }
 
@@ -557,7 +563,7 @@ pub async fn api_delete_host(
 ) -> Html<String> {
     match db::deactivate_host(&state.db, &host_id) {
         Ok(_) => Html(String::new()), // Row removed from DOM via hx-swap
-        Err(e) => Html(templates::alert_error(&format!("Failed: {}", e))),
+        Err(e) => Html(templates::alert_error(&safe_error("Operation failed", e))),
     }
 }
 
@@ -921,7 +927,7 @@ pub async fn api_save_general_settings(
     ];
     for (key, val) in &pairs {
         if let Err(e) = db::set_setting(&state.db, key, val) {
-            return Html(templates::alert_error(&format!("Failed to save: {}", e)));
+            return Html(templates::alert_error(&safe_error("Failed to save settings", e)));
         }
     }
     Html(templates::alert_success("General settings saved."))
@@ -1025,7 +1031,7 @@ pub async fn api_save_badge_branding(
     ];
     for (key, val) in &pairs {
         if let Err(e) = db::set_setting(&state.db, key, val) {
-            return Html(templates::alert_error(&format!("Failed to save: {}", e)));
+            return Html(templates::alert_error(&safe_error("Failed to save settings", e)));
         }
     }
     Html(templates::alert_success("Badge branding saved."))
@@ -1193,7 +1199,7 @@ pub async fn api_save_smtp_settings(
     ];
     for (key, val) in &pairs {
         if let Err(e) = db::set_setting(&state.db, key, val) {
-            return Html(templates::alert_error(&format!("Failed to save: {}", e)));
+            return Html(templates::alert_error(&safe_error("Failed to save settings", e)));
         }
     }
     Html(templates::alert_success("Email settings saved."))
@@ -1223,11 +1229,13 @@ pub async fn api_test_smtp(
             "Test email sent to {} via Microsoft Graph. Check your inbox.",
             to
         ))),
-        Err(e) => Html(templates::alert_error(&format!(
-            "Send failed: {}. Make sure Graph API credentials are configured \
-             in the Calendar section above, with Mail.Send permission.",
-            e
-        ))),
+        Err(e) => {
+            tracing::error!("SMTP test failed: {}", e);
+            Html(templates::alert_error(
+                "Send failed. Make sure Graph API credentials are configured \
+                 in the Calendar section above, with Mail.Send permission."
+            ))
+        },
     }
 }
 
