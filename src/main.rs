@@ -29,6 +29,7 @@ pub struct AppState {
     pub photos_dir: std::path::PathBuf,
     pub password_hash: Option<String>,
     pub admin_password_hash: Option<String>,
+    pub kiosk_secret: Option<String>,
 }
 
 /// User role, injected into request extensions by auth middleware.
@@ -168,7 +169,22 @@ async fn main() {
     );
     std::fs::create_dir_all(&photos_dir).expect("Failed to create photos directory");
 
-    let state = Arc::new(AppState { db: pool, graph, photos_dir, password_hash, admin_password_hash });
+    // Kiosk API secret — required for /api/kiosk/checkin
+    let kiosk_secret = match std::env::var("GATEKEEPER_KIOSK_SECRET") {
+        Ok(s) if !s.is_empty() => {
+            tracing::info!("Kiosk API secret configured — kiosk endpoint protected");
+            Some(s)
+        }
+        _ => {
+            tracing::warn!(
+                "GATEKEEPER_KIOSK_SECRET not set — kiosk endpoint is unprotected! \
+                 Set this env var to require a secret for kiosk check-ins."
+            );
+            None
+        }
+    };
+
+    let state = Arc::new(AppState { db: pool, graph, photos_dir, password_hash, admin_password_hash, kiosk_secret });
 
     // Promote rescheduled visits whose expected date has arrived
     let promoted = db::promote_rescheduled_visits(&state.db);

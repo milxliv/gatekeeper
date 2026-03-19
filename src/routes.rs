@@ -796,8 +796,21 @@ pub struct KioskCheckInResponse {
 /// JSON check-in endpoint for kiosk / tablet UI
 pub async fn api_kiosk_checkin(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<KioskCheckInRequest>,
 ) -> Result<Json<KioskCheckInResponse>, StatusCode> {
+    // Verify kiosk secret if configured
+    if let Some(ref secret) = state.kiosk_secret {
+        let provided = headers
+            .get("x-kiosk-secret")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if provided != secret {
+            tracing::warn!("Kiosk check-in rejected: invalid or missing X-Kiosk-Secret header");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+
     if req.visitor_name.trim().is_empty() || req.host_id.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
