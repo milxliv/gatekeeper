@@ -32,6 +32,7 @@ impl CachedToken {
 
 /// Configuration loaded from environment variables
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct GraphConfig {
     pub tenant_id: String,
     pub client_id: String,

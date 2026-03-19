@@ -8,7 +8,7 @@ use axum::{
 };
 use chrono::TimeZone;
 use serde::{Deserialize, Serialize};
-use crate::db::{self, DbPool};
+use crate::db;
 use crate::graph_service::VisitRecord;
 use crate::models::*;
 use crate::templates;
@@ -112,13 +112,6 @@ fn apply_theme(state: &AppState) {
 
 fn apply_role(role: &crate::UserRole) {
     templates::set_role(&role.0);
-}
-
-/// Extract the UserRole from request extensions
-fn extract_role(extensions: &axum::http::Extensions) -> crate::UserRole {
-    extensions.get::<crate::UserRole>()
-        .cloned()
-        .unwrap_or(crate::UserRole("admin".to_string()))
 }
 
 // ── Page routes ───────────────────────────────────────────────

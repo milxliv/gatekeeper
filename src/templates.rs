@@ -923,8 +923,7 @@ pub fn dashboard_page(
 }
 
 /// Pre-registration form page
-pub fn pre_register_page(hosts: &[Host], purposes: &str, areas: &str, visitor_types: &str) -> String {
-    let host_options = hosts_to_options(hosts);
+pub fn pre_register_page(_hosts: &[Host], purposes: &str, areas: &str, visitor_types: &str) -> String {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let purpose_buttons = build_purpose_buttons(purposes);
     let area_options = build_area_options(areas);
@@ -2236,8 +2235,7 @@ pub fn admin_page(
 // ── Group Visit ───────────────────────────────────────────────
 
 /// Group visit registration form
-pub fn group_visit_page(hosts: &[Host], purposes: &str, areas: &str, visitor_types: &str) -> String {
-    let host_options = hosts_to_options(hosts);
+pub fn group_visit_page(_hosts: &[Host], purposes: &str, areas: &str, visitor_types: &str) -> String {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let purpose_buttons = build_purpose_buttons(purposes);
     let area_options = build_area_options(areas);

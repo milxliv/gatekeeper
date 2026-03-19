@@ -43,25 +43,6 @@ pub struct NewVisitor {
 
 // ── Visit ─────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Visit {
-    pub id: String,
-    pub visitor_id: String,
-    pub host_id: String,
-    pub purpose: String,
-    pub areas_requested: Option<String>,
-    pub badge_number: Option<String>,
-    pub status: String,
-    pub pre_registered: bool,
-    pub expected_date: Option<String>,
-    pub check_in: Option<String>,
-    pub check_out: Option<String>,
-    pub created_at: String,
-    pub is_group: bool,
-    pub group_name: Option<String>,
-    pub group_size: Option<i32>,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct NewVisit {
     pub visitor_id: String,

@@ -2,7 +2,7 @@ pub mod auth;
 pub mod calendar;
 
 pub use auth::{GraphConfig, TokenProvider};
-pub use calendar::{CalendarClient, CreatedEvent, VisitorEvent};
+pub use calendar::{CalendarClient, VisitorEvent};
 
 use anyhow::Result;
 

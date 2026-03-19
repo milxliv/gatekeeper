@@ -75,6 +75,7 @@ enum ShowAs {
 // --- Response Types ---
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct CreatedEvent {
     pub id: String,
     pub subject: String,

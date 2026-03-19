@@ -568,15 +568,6 @@ pub fn push_expected_time(db: &DbPool, visit_id: &str, delay_minutes: i32) -> Re
     Ok(())
 }
 
-/// Update the special_notes field on a visit
-pub fn set_visit_note(db: &DbPool, visit_id: &str, note: &str) -> Result<()> {
-    let conn = db.lock().unwrap();
-    conn.execute(
-        "UPDATE visits SET special_notes = ?1 WHERE id = ?2",
-        params![note, visit_id],
-    )?;
-    Ok(())
-}
 
 /// Reschedule a visit to a new date and optionally a new time
 pub fn reschedule_visit(
