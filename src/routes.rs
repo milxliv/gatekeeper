@@ -37,6 +37,7 @@ pub struct LoginForm {
 
 pub async fn api_login(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> impl IntoResponse {
     if state.password_hash.is_none() {
@@ -71,9 +72,12 @@ pub async fn api_login(
         Some(role) => {
             let token = uuid::Uuid::new_v4().to_string();
             let _ = db::create_session(&state.db, &token, role, 24);
+            // Use Secure flag only when behind HTTPS (e.g. Cloudflare tunnel)
+            let secure = if headers.get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok()) == Some("https") { "; Secure" } else { "" };
             let cookie = format!(
-                "gk_session={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400",
-                token
+                "gk_session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400{}",
+                token, secure
             );
             (
                 [(axum::http::header::SET_COOKIE, cookie)],
