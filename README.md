@@ -15,7 +15,7 @@ cp .env.example .env
 
 # Run
 ./target/release/gatekeeper
-# → http://localhost:3006
+# → http://localhost:3000 (or GATEKEEPER_PORT if set)
 ```
 
 ## Configuration
