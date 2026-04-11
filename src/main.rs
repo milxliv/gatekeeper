@@ -11,7 +11,7 @@ use axum::{
     extract::State,
     http::header,
     middleware,
-    response::{Html, IntoResponse},
+    response::IntoResponse,
     routing::{get, post},
     Router,
 };
@@ -36,21 +36,19 @@ pub struct AppState {
 #[derive(Clone, Debug)]
 pub struct UserRole(pub String); // "admin" or "user"
 
-/// Auth middleware — redirects to /login if no valid session cookie.
-/// Injects UserRole into request extensions for downstream handlers.
-/// Admin routes (/admin/*) require "admin" role.
-async fn require_auth(
+/// Reception auth middleware — no admin routes exist on this port.
+/// If no password is set, passes through as "user" (no admin on reception).
+async fn require_reception_auth(
     State(state): State<Arc<AppState>>,
     mut request: axum::extract::Request,
     next: middleware::Next,
 ) -> axum::response::Response {
-    // If no password configured, pass through as admin (backward compat)
+    // If no password configured, pass through as user
     if state.password_hash.is_none() {
-        request.extensions_mut().insert(UserRole("admin".to_string()));
+        request.extensions_mut().insert(UserRole("user".to_string()));
         return next.run(request).await;
     }
 
-    // Public paths that don't require auth
     let path = request.uri().path().to_string();
     if path == "/login"
         || path.starts_with("/static/")
@@ -62,21 +60,15 @@ async fn require_auth(
         return next.run(request).await;
     }
 
-    // Extract session cookie and validate
     if let Some(cookie_header) = request.headers().get("cookie") {
         if let Ok(cookies) = cookie_header.to_str() {
             for cookie in cookies.split(';') {
                 let cookie = cookie.trim();
                 if let Some(token) = cookie.strip_prefix("gk_session=") {
-                    if let Some(role) = db::validate_session(&state.db, token) {
-                        // Admin routes require admin role
-                        if path.starts_with("/admin") && role != "admin" {
-                            return (
-                                axum::http::StatusCode::FORBIDDEN,
-                                Html("<h2>Access Denied</h2><p>Admin privileges required.</p><a href=\"/\">Back to Dashboard</a>"),
-                            ).into_response();
-                        }
-                        request.extensions_mut().insert(UserRole(role));
+                    if db::validate_session(&state.db, token).is_some() {
+                        request
+                            .extensions_mut()
+                            .insert(UserRole("user".to_string()));
                         return next.run(request).await;
                     }
                 }
@@ -84,13 +76,52 @@ async fn require_auth(
         }
     }
 
-    // Not authenticated — redirect to login
+    axum::response::Redirect::to("/login").into_response()
+}
+
+/// Admin auth middleware — validates gk_admin_session cookie.
+async fn require_admin_auth(
+    State(state): State<Arc<AppState>>,
+    mut request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let path = request.uri().path().to_string();
+
+    // Public paths on the admin port
+    if path == "/login"
+        || path.starts_with("/static/")
+        || path == "/totp/confirm"
+    {
+        request
+            .extensions_mut()
+            .insert(UserRole("admin".to_string()));
+        return next.run(request).await;
+    }
+
+    // Validate admin session cookie
+    if let Some(cookie_header) = request.headers().get("cookie") {
+        if let Ok(cookies) = cookie_header.to_str() {
+            for cookie in cookies.split(';') {
+                let cookie = cookie.trim();
+                if let Some(token) = cookie.strip_prefix("gk_admin_session=") {
+                    if let Some(role) = db::validate_session(&state.db, token) {
+                        if role == "admin" {
+                            request
+                                .extensions_mut()
+                                .insert(UserRole("admin".to_string()));
+                            return next.run(request).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     axum::response::Redirect::to("/login").into_response()
 }
 
 #[tokio::main]
-async fn main() {
-    // Load .env file if present (dev convenience)
+async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
 
     tracing_subscriber::fmt()
@@ -100,7 +131,6 @@ async fn main() {
         )
         .init();
 
-    // Initialize SQLite
     let db_path = std::env::var("GATEKEEPER_DB")
         .unwrap_or_else(|_| "gatekeeper.db".to_string());
 
@@ -108,10 +138,8 @@ async fn main() {
 
     tracing::info!("Database initialized at {}", db_path);
 
-    // Seed some demo hosts if the table is empty
     seed_demo_data(&pool);
 
-    // Password hashing helper (argon2 — salted, resistant to rainbow tables)
     let hash_password = |pw: &str| -> String {
         use argon2::password_hash::{PasswordHasher, SaltString, rand_core};
         let salt = SaltString::generate(&mut rand_core::OsRng);
@@ -121,7 +149,6 @@ async fn main() {
             .to_string()
     };
 
-    // Front desk password
     let password_hash = match std::env::var("GATEKEEPER_PASSWORD") {
         Ok(pw) if !pw.is_empty() => {
             tracing::info!("Front desk authentication enabled");
@@ -129,28 +156,27 @@ async fn main() {
         }
         _ => {
             tracing::warn!(
-                "GATEKEEPER_PASSWORD not set — app is unprotected! \
+                "GATEKEEPER_PASSWORD not set — reception dashboard is unprotected! \
                  Set this env var to enable login."
             );
             None
         }
     };
 
-    // Admin password (falls back to front desk password if not set)
     let admin_password_hash = match std::env::var("GATEKEEPER_ADMIN_PASSWORD") {
         Ok(pw) if !pw.is_empty() => {
             tracing::info!("Admin authentication enabled (separate admin password)");
             Some(hash_password(&pw))
         }
         _ => {
-            if password_hash.is_some() {
-                tracing::info!("GATEKEEPER_ADMIN_PASSWORD not set — front desk password also grants admin access");
-            }
+            tracing::warn!(
+                "GATEKEEPER_ADMIN_PASSWORD not set — admin port will reject \
+                 all logins. Set this env var to enable admin access."
+            );
             None
         }
     };
 
-    // Graph service — optional, gracefully disabled if env vars missing
     let graph = match graph_service::GraphService::from_env() {
         Ok(svc) => {
             tracing::info!("Graph calendar integration enabled");
@@ -165,39 +191,43 @@ async fn main() {
     };
 
     let photos_dir = std::path::PathBuf::from(
-        std::env::var("GATEKEEPER_PHOTOS").unwrap_or_else(|_| "photos".to_string())
+        std::env::var("GATEKEEPER_PHOTOS")
+            .unwrap_or_else(|_| "photos".to_string()),
     );
     std::fs::create_dir_all(&photos_dir).expect("Failed to create photos directory");
 
-    // Kiosk API secret — required for /api/kiosk/checkin
     let kiosk_secret = match std::env::var("GATEKEEPER_KIOSK_SECRET") {
         Ok(s) if !s.is_empty() => {
-            tracing::info!("Kiosk API secret configured — kiosk endpoint protected");
+            tracing::info!("Kiosk API secret configured");
             Some(s)
         }
         _ => {
             tracing::warn!(
-                "GATEKEEPER_KIOSK_SECRET not set — kiosk endpoint is unprotected! \
-                 Set this env var to require a secret for kiosk check-ins."
+                "GATEKEEPER_KIOSK_SECRET not set — kiosk endpoint is unprotected!"
             );
             None
         }
     };
 
-    let state = Arc::new(AppState { db: pool, graph, photos_dir, password_hash, admin_password_hash, kiosk_secret });
+    let state = Arc::new(AppState {
+        db: pool,
+        graph,
+        photos_dir,
+        password_hash,
+        admin_password_hash,
+        kiosk_secret,
+    });
 
-    // Promote rescheduled visits whose expected date has arrived
     let promoted = db::promote_rescheduled_visits(&state.db);
     if promoted > 0 {
         tracing::info!("Promoted {} rescheduled visit(s) to pending", promoted);
     }
 
-    // Background cleanup task (photos + expired sessions)
+    // Background cleanup task
     {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             loop {
-                // Photo cleanup
                 let hours: i64 = db::get_setting(&state.db, "photo_retention_hours")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(24);
@@ -214,19 +244,21 @@ async fn main() {
                         }
                         let cleared = db::clear_expired_photos(&state.db, hours);
                         tracing::info!(
-                            "Photo cleanup: deleted {} files, cleared {} DB records (retention={}h)",
+                            "Photo cleanup: deleted {} files, cleared {} DB records \
+                             (retention={}h)",
                             deleted, cleared, hours
                         );
                     }
                 }
 
-                // Session cleanup
                 db::cleanup_expired_sessions(&state.db);
 
-                // Promote rescheduled visits whose date has arrived
                 let promoted = db::promote_rescheduled_visits(&state.db);
                 if promoted > 0 {
-                    tracing::info!("Promoted {} rescheduled visit(s) to pending", promoted);
+                    tracing::info!(
+                        "Promoted {} rescheduled visit(s) to pending",
+                        promoted
+                    );
                 }
 
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
@@ -234,67 +266,157 @@ async fn main() {
         });
     }
 
-    let app = Router::new()
-        // Auth routes (public)
+    // ── Reception router (port 3000) ─────────────────────────
+    let reception_app = Router::new()
         .route("/login", get(routes::page_login).post(routes::api_login))
         .route("/logout", post(routes::api_logout))
-        // Embedded static assets
         .route("/static/htmx.min.js", get(serve_htmx))
-        // Page routes
         .route("/", get(routes::page_dashboard))
         .route("/pre-register", get(routes::page_pre_register))
         .route("/walk-in", get(routes::page_walk_in))
         .route("/group-visit", get(routes::page_group_visit))
         .route("/hosts", get(routes::page_hosts))
         .route("/log", get(routes::page_log))
-        .route("/admin", get(routes::page_admin))
-        .route("/admin/settings", post(routes::api_save_general_settings))
-        .route("/admin/settings/smtp", post(routes::api_save_smtp_settings))
-        .route("/admin/settings/smtp/test", post(routes::api_test_smtp))
-        .route("/admin/settings/theme", post(routes::api_save_theme))
-        .route("/admin/settings/dropdowns", post(routes::api_save_dropdowns))
-        .route("/admin/settings/badge", post(routes::api_save_badge_branding))
-        .route("/admin/settings/badge/logo", post(routes::api_upload_logo))
-        .route("/badge/preview", get(routes::page_badge_preview))
         // API routes (HTMX partials)
         .route("/api/dashboard/today", get(routes::api_dashboard_today))
         .route("/api/pre-register", post(routes::api_pre_register))
         .route("/api/walk-in", post(routes::api_walk_in))
         .route("/api/group-visit", post(routes::api_group_visit))
-        .route("/api/hosts", post(routes::api_add_host))
-        .route("/api/hosts/:id", post(routes::api_update_host).delete(routes::api_delete_host))
-        .route("/api/visits/:id/approve", post(routes::api_approve_visit))
+        .route(
+            "/api/visits/:id/approve",
+            post(routes::api_approve_visit),
+        )
         .route("/api/visits/:id/deny", post(routes::api_deny_visit))
         .route("/api/visits/:id/late", post(routes::api_late_visit))
-        .route("/api/visits/:id/reschedule", post(routes::api_reschedule_visit))
-        .route("/api/visits/:id/checkin", post(routes::api_checkin_visit))
-        .route("/api/visits/checkout-all", post(routes::api_checkout_all))
-        .route("/api/visits/:id/checkout", post(routes::api_checkout_visit))
+        .route(
+            "/api/visits/:id/reschedule",
+            post(routes::api_reschedule_visit),
+        )
+        .route(
+            "/api/visits/:id/checkin",
+            post(routes::api_checkin_visit),
+        )
+        .route(
+            "/api/visits/checkout-all",
+            post(routes::api_checkout_all),
+        )
+        .route(
+            "/api/visits/:id/checkout",
+            post(routes::api_checkout_visit),
+        )
         .route("/api/log/search", get(routes::api_log_search))
         // Kiosk JSON API
         .route("/api/kiosk/checkin", post(routes::api_kiosk_checkin))
         // Badge printing
         .route("/badge/:id", get(routes::page_badge))
+        .route("/badge/preview", get(routes::page_badge_preview))
         // Photo capture
-        .route("/api/visits/:id/visitor-id", get(routes::api_visit_visitor_id))
+        .route(
+            "/api/visits/:id/visitor-id",
+            get(routes::api_visit_visitor_id),
+        )
         .route("/api/visitors/search", get(routes::api_search_visitors))
         .route("/api/hosts/search", get(routes::api_search_hosts))
-        .route("/api/visitors/:id/photo", post(routes::api_upload_photo))
+        .route(
+            "/api/visitors/:id/photo",
+            post(routes::api_upload_photo),
+        )
         .route("/photos/:filename", get(routes::serve_photo))
-        // Auth middleware — applied to all routes
-        .layer(middleware::from_fn_with_state(state.clone(), require_auth))
-        .with_state(state);
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_reception_auth,
+        ))
+        .with_state(state.clone());
+
+    // ── Admin router (port 3001) ─────────────────────────────
+    let admin_app = Router::new()
+        .route(
+            "/login",
+            get(routes::page_admin_login).post(routes::api_admin_login),
+        )
+        .route("/logout", post(routes::api_admin_logout))
+        .route("/totp/confirm", post(routes::api_admin_totp_confirm))
+        .route("/static/htmx.min.js", get(serve_htmx))
+        // Admin pages
+        .route("/admin", get(routes::page_admin))
+        .route(
+            "/admin/settings",
+            post(routes::api_save_general_settings),
+        )
+        .route(
+            "/admin/settings/smtp",
+            post(routes::api_save_smtp_settings),
+        )
+        .route(
+            "/admin/settings/smtp/test",
+            post(routes::api_test_smtp),
+        )
+        .route(
+            "/admin/settings/theme",
+            post(routes::api_save_theme),
+        )
+        .route(
+            "/admin/settings/dropdowns",
+            post(routes::api_save_dropdowns),
+        )
+        .route(
+            "/admin/settings/badge",
+            post(routes::api_save_badge_branding),
+        )
+        .route(
+            "/admin/settings/badge/logo",
+            post(routes::api_upload_logo),
+        )
+        .route("/badge/preview", get(routes::page_badge_preview))
+        // Host management (admin-only)
+        .route("/hosts", get(routes::page_hosts))
+        .route("/api/hosts", post(routes::api_add_host))
+        .route(
+            "/api/hosts/:id",
+            post(routes::api_update_host).delete(routes::api_delete_host),
+        )
+        .route("/api/hosts/search", get(routes::api_search_hosts))
+        // Photos (needed for badge preview with logos)
+        .route("/photos/:filename", get(routes::serve_photo))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_auth,
+        ))
+        .with_state(state.clone());
 
     let port: u16 = std::env::var("GATEKEEPER_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!("GateKeeper running at http://localhost:{}", port);
+    let admin_port: u16 = std::env::var("GATEKEEPER_ADMIN_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3001);
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let reception_addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let admin_addr = SocketAddr::from(([127, 0, 0, 1], admin_port));
+
+    tracing::info!(
+        "GateKeeper reception at http://localhost:{}",
+        port
+    );
+    tracing::info!(
+        "GateKeeper admin at http://127.0.0.1:{} (localhost only)",
+        admin_port
+    );
+
+    let reception_listener =
+        tokio::net::TcpListener::bind(reception_addr).await?;
+    let admin_listener =
+        tokio::net::TcpListener::bind(admin_addr).await?;
+
+    tokio::try_join!(
+        axum::serve(reception_listener, reception_app),
+        axum::serve(admin_listener, admin_app),
+    )?;
+
+    Ok(())
 }
 
 fn seed_demo_data(pool: &db::DbPool) {

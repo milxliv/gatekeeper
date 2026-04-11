@@ -1431,6 +1431,240 @@ pub async fn api_search_hosts(
     Json(results)
 }
 
+// ── Admin port auth (separate port with TOTP) ────────────────
+
+pub async fn page_admin_login(
+    State(state): State<Arc<AppState>>,
+) -> Html<String> {
+    let needs_totp = db::has_totp_secret(&state.db);
+    Html(templates::admin_login_page(None, needs_totp))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminLoginForm {
+    pub password: String,
+    #[serde(default)]
+    pub totp_code: Option<String>,
+}
+
+pub async fn api_admin_login(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<AdminLoginForm>,
+) -> impl IntoResponse {
+    use argon2::{Argon2, PasswordVerifier, PasswordHash};
+
+    // Verify admin password
+    let password_valid = if let Some(ref admin_hash) = state.admin_password_hash {
+        PasswordHash::new(admin_hash)
+            .map(|parsed| {
+                Argon2::default()
+                    .verify_password(form.password.as_bytes(), &parsed)
+                    .is_ok()
+            })
+            .unwrap_or(false)
+    } else {
+        // No admin password configured — reject all admin logins
+        false
+    };
+
+    if !password_valid {
+        let needs_totp = db::has_totp_secret(&state.db);
+        return Html(templates::admin_login_page(
+            Some("Invalid admin password."),
+            needs_totp,
+        ))
+        .into_response();
+    }
+
+    // Check if TOTP is configured
+    if let Some(secret_b32) = db::get_setting(&state.db, "totp_secret") {
+        if !secret_b32.is_empty() {
+            // TOTP is configured — validate the code
+            let code = form.totp_code.as_deref().unwrap_or("").trim();
+            if code.is_empty() {
+                return Html(templates::admin_login_page(
+                    Some("Authenticator code is required."),
+                    true,
+                ))
+                .into_response();
+            }
+
+            match build_totp(&secret_b32) {
+                Ok(totp) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if !totp.check(code, now) {
+                        return Html(templates::admin_login_page(
+                            Some("Invalid authenticator code. Try again."),
+                            true,
+                        ))
+                        .into_response();
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("TOTP error: {}", e);
+                    return Html(templates::admin_login_page(
+                        Some("TOTP configuration error. Contact admin."),
+                        true,
+                    ))
+                    .into_response();
+                }
+            }
+
+            // Password + TOTP valid — create session
+            return create_admin_session(&state, &headers).into_response();
+        }
+    }
+
+    // No TOTP configured — first-time setup: generate secret and show QR
+    let secret = totp_rs::Secret::generate_secret();
+    let secret_b32 = secret.to_encoded().to_string();
+
+    match build_totp(&secret_b32) {
+        Ok(totp) => {
+            // Store secret in DB
+            if let Err(e) = db::set_setting(&state.db, "totp_secret", &secret_b32) {
+                tracing::error!("Failed to store TOTP secret: {}", e);
+                return Html(templates::admin_login_page(
+                    Some("Failed to save TOTP configuration."),
+                    false,
+                ))
+                .into_response();
+            }
+
+            let qr_uri = totp
+                .get_qr_base64()
+                .unwrap_or_else(|_| String::new());
+            let qr_src = format!("data:image/png;base64,{}", qr_uri);
+
+            Html(templates::totp_setup_page(&qr_src, &secret_b32, None))
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!("Failed to generate TOTP: {}", e);
+            Html(templates::admin_login_page(
+                Some("Failed to generate TOTP. Try again."),
+                false,
+            ))
+            .into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TotpConfirmForm {
+    pub code: String,
+}
+
+pub async fn api_admin_totp_confirm(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<TotpConfirmForm>,
+) -> impl IntoResponse {
+    let secret_b32 = match db::get_setting(&state.db, "totp_secret") {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return axum::response::Redirect::to("/login").into_response();
+        }
+    };
+
+    let code = form.code.trim();
+    match build_totp(&secret_b32) {
+        Ok(totp) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if !totp.check(code, now) {
+                // Invalid code — remove the secret so they can retry setup
+                let _ = db::set_setting(&state.db, "totp_secret", "");
+                let qr_uri = totp
+                    .get_qr_base64()
+                    .unwrap_or_else(|_| String::new());
+                let qr_src = format!("data:image/png;base64,{}", qr_uri);
+                return Html(templates::totp_setup_page(
+                    &qr_src,
+                    &secret_b32,
+                    Some("Invalid code. Scan the QR code again and retry."),
+                ))
+                .into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!("TOTP verify error: {}", e);
+            let _ = db::set_setting(&state.db, "totp_secret", "");
+            return axum::response::Redirect::to("/login").into_response();
+        }
+    }
+
+    // TOTP confirmed — create admin session
+    tracing::info!("TOTP setup complete — admin MFA is now active");
+    create_admin_session(&state, &headers).into_response()
+}
+
+pub async fn api_admin_logout(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Some(cookie_header) = headers.get("cookie") {
+        if let Ok(cookies) = cookie_header.to_str() {
+            for cookie in cookies.split(';') {
+                let cookie = cookie.trim();
+                if let Some(token) = cookie.strip_prefix("gk_admin_session=") {
+                    db::delete_session(&state.db, token);
+                }
+            }
+        }
+    }
+    let clear = "gk_admin_session=; Path=/; HttpOnly; Max-Age=0";
+    (
+        [(axum::http::header::SET_COOKIE, clear)],
+        axum::response::Redirect::to("/login"),
+    )
+}
+
+fn build_totp(secret_b32: &str) -> Result<totp_rs::TOTP, String> {
+    let secret = totp_rs::Secret::Encoded(secret_b32.to_string());
+    totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret.to_bytes().map_err(|e| format!("{}", e))?,
+        Some("GateKeeper".to_string()),
+        "admin@gatekeeper".to_string(),
+    )
+    .map_err(|e| format!("{}", e))
+}
+
+fn create_admin_session(
+    state: &crate::AppState,
+    headers: &axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let token = uuid::Uuid::new_v4().to_string();
+    let _ = db::create_session(&state.db, &token, "admin", 8);
+    let secure = if headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        == Some("https")
+    {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!(
+        "gk_admin_session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800{}",
+        token, secure
+    );
+    (
+        [(axum::http::header::SET_COOKIE, cookie)],
+        axum::response::Redirect::to("/admin"),
+    )
+}
+
 // ── Utilities ─────────────────────────────────────────────────
 
 fn non_empty(s: Option<String>) -> Option<String> {

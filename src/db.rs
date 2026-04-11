@@ -241,6 +241,13 @@ pub fn set_setting(db: &DbPool, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check if a TOTP secret has been configured for admin MFA.
+pub fn has_totp_secret(db: &DbPool) -> bool {
+    get_setting(db, "totp_secret")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+}
+
 /// Generate the next badge number for today. Counts today's checked-in visits
 /// and returns prefix + zero-padded sequence (e.g., "V-001", "V-002").
 pub fn next_badge_number(db: &DbPool) -> String {

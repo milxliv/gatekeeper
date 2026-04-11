@@ -2844,6 +2844,192 @@ fn hosts_to_options(hosts: &[Host]) -> String {
 }
 
 /// HTMX partial: success alert (escapes HTML in message)
+/// Admin login page (separate port) — password + optional TOTP field
+pub fn admin_login_page(error: Option<&str>, needs_totp: bool) -> String {
+    let error_html = match error {
+        Some(msg) => format!(
+            r#"<div style="color:#dc2626;background:#fee2e2;padding:0.75rem;
+            border-radius:6px;margin-bottom:1rem;font-size:0.9rem;">{}</div>"#,
+            html_escape(msg)
+        ),
+        None => String::new(),
+    };
+
+    let totp_field = if needs_totp {
+        r#"<label for="totp_code">Authenticator Code</label>
+        <input type="text" name="totp_code" id="totp_code"
+               placeholder="6-digit code" inputmode="numeric"
+               pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code"
+               required
+               style="width:100%;padding:0.75rem;border:1px solid #d1d5db;
+               border-radius:6px;font-size:1.2rem;letter-spacing:0.3em;
+               text-align:center;margin-bottom:1rem;">"#
+    } else {
+        r#"<input type="hidden" name="totp_code" value="">"#
+    };
+
+    let totp_note = if !needs_totp {
+        r#"<p style="color:#666;font-size:0.8rem;margin-top:0.75rem;
+        text-align:center;">TOTP will be configured after first login.</p>"#
+    } else {
+        ""
+    };
+
+    format!(r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>GateKeeper — Admin Login</title>
+<style>
+* {{ margin:0; padding:0; box-sizing:border-box; }}
+body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                 Helvetica, Arial, sans-serif;
+    background: #1a1a2e; display:flex; justify-content:center;
+    align-items:center; min-height:100vh;
+}}
+.login-card {{
+    background: #fff; border-radius: 12px; padding: 2.5rem;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.3); width: 100%;
+    max-width: 380px;
+}}
+.login-card h1 {{ font-size:1.5rem; margin-bottom:0.25rem; }}
+.login-card .sub {{
+    color:#666; font-size:0.9rem; margin-bottom:1.5rem;
+}}
+.login-card .admin-badge {{
+    display:inline-block; background:#dc2626; color:#fff;
+    font-size:0.7rem; font-weight:700; padding:2px 8px;
+    border-radius:4px; vertical-align:middle; margin-left:6px;
+}}
+.login-card label {{
+    display:block; font-weight:600; margin-bottom:0.4rem;
+    font-size:0.9rem;
+}}
+.login-card input[type="password"] {{
+    width:100%; padding:0.75rem; border:1px solid #d1d5db;
+    border-radius:6px; font-size:1rem; margin-bottom:1rem;
+}}
+.login-card button {{
+    width:100%; padding:0.75rem; background:#dc2626; color:#fff;
+    border:none; border-radius:6px; font-size:1rem; font-weight:600;
+    cursor:pointer;
+}}
+.login-card button:hover {{ background:#b91c1c; }}
+</style>
+</head>
+<body>
+<div class="login-card">
+    <h1>GateKeeper <span class="admin-badge">ADMIN</span></h1>
+    <p class="sub">Administrative Access</p>
+    {error}
+    <form method="POST" action="/login">
+        <label for="password">Admin Password</label>
+        <input type="password" name="password" id="password"
+               placeholder="Enter admin password" autofocus required>
+        {totp_field}
+        <button type="submit">Sign In</button>
+    </form>
+    {totp_note}
+</div>
+</body>
+</html>"#,
+        error = error_html,
+        totp_field = totp_field,
+        totp_note = totp_note,
+    )
+}
+
+/// TOTP setup page — shown on first admin login to scan QR into Authy
+pub fn totp_setup_page(
+    qr_data_uri: &str,
+    secret: &str,
+    error: Option<&str>,
+) -> String {
+    let error_html = match error {
+        Some(msg) => format!(
+            r#"<div style="color:#dc2626;background:#fee2e2;padding:0.75rem;
+            border-radius:6px;margin-bottom:1rem;font-size:0.9rem;">{}</div>"#,
+            html_escape(msg)
+        ),
+        None => String::new(),
+    };
+
+    format!(r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>GateKeeper — TOTP Setup</title>
+<style>
+* {{ margin:0; padding:0; box-sizing:border-box; }}
+body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                 Helvetica, Arial, sans-serif;
+    background: #1a1a2e; display:flex; justify-content:center;
+    align-items:center; min-height:100vh;
+}}
+.setup-card {{
+    background: #fff; border-radius: 12px; padding: 2.5rem;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.3); width: 100%;
+    max-width: 440px; text-align: center;
+}}
+.setup-card h1 {{ font-size:1.4rem; margin-bottom:0.5rem; }}
+.setup-card .sub {{
+    color:#666; font-size:0.9rem; margin-bottom:1.5rem;
+}}
+.qr-img {{
+    border: 1px solid #e5e7eb; border-radius: 8px;
+    padding: 8px; margin-bottom: 1rem;
+}}
+.secret-code {{
+    font-family: monospace; font-size: 0.85rem; background: #f3f4f6;
+    padding: 0.5rem 1rem; border-radius: 6px; margin-bottom: 1.5rem;
+    word-break: break-all; color: #374151;
+}}
+.setup-card label {{
+    display:block; font-weight:600; margin-bottom:0.4rem;
+    font-size:0.9rem; text-align:left;
+}}
+.setup-card input[type="text"] {{
+    width:100%; padding:0.75rem; border:1px solid #d1d5db;
+    border-radius:6px; font-size:1.2rem; letter-spacing:0.3em;
+    text-align:center; margin-bottom:1rem;
+}}
+.setup-card button {{
+    width:100%; padding:0.75rem; background:#059669; color:#fff;
+    border:none; border-radius:6px; font-size:1rem; font-weight:600;
+    cursor:pointer;
+}}
+.setup-card button:hover {{ background:#047857; }}
+</style>
+</head>
+<body>
+<div class="setup-card">
+    <h1>Set Up Authenticator</h1>
+    <p class="sub">Scan this QR code with Authy, Google Authenticator,
+    or any TOTP app.</p>
+    {error}
+    <img class="qr-img" src="{qr}" alt="TOTP QR Code"
+         width="200" height="200"><br>
+    <p style="font-size:0.8rem;color:#666;margin-bottom:0.5rem;">
+    Or enter this code manually:</p>
+    <div class="secret-code">{secret}</div>
+    <form method="POST" action="/totp/confirm">
+        <label for="code">Enter 6-digit code to confirm</label>
+        <input type="text" name="code" id="code" inputmode="numeric"
+               pattern="[0-9]{{6}}" maxlength="6"
+               autocomplete="one-time-code" autofocus required>
+        <button type="submit">Verify &amp; Activate</button>
+    </form>
+</div>
+</body>
+</html>"#,
+        error = error_html,
+        qr = qr_data_uri,
+        secret = html_escape(secret),
+    )
+}
+
 pub fn alert_success(msg: &str) -> String {
     format!(r##"<div class="alert alert-success">{}</div>"##, html_escape(msg))
 }
