@@ -314,6 +314,103 @@ pub fn clear_expired_photos(db: &DbPool, retention_hours: i64) -> usize {
     ).unwrap_or(0)
 }
 
+/// Result of a retention sweep over checked-out visits. `photo_filenames`
+/// are paths that must be unlinked from disk by the caller (the DB no
+/// longer references them after this call).
+#[derive(Debug, Default)]
+pub struct PurgeResult {
+    pub visits_deleted: usize,
+    pub visitors_deleted: usize,
+    pub photo_filenames: Vec<String>,
+}
+
+/// Purge checked-out visits older than `hours`, plus any visitor rows that
+/// become orphaned (no remaining visit with status != 'checked_out' or
+/// with check_out within the retention window). This implements Path A
+/// minimization for the §10 PII-locality compliance posture: visitor PII
+/// (name, phone, email, photo) is removed once the visit is settled and
+/// the retention window has elapsed. The host's M365 calendar event
+/// remains as the canonical long-term audit trail.
+pub fn purge_old_visits(db: &DbPool, hours: i64) -> PurgeResult {
+    if hours <= 0 {
+        return PurgeResult::default();
+    }
+    let conn = db.lock().unwrap();
+    let cutoff = (chrono::Local::now() - chrono::Duration::hours(hours))
+        .format("%Y-%m-%d %H:%M")
+        .to_string();
+
+    // Identify visitors who would have no retained visits after this sweep.
+    // A visit is "retained" if its status is anything other than
+    // checked_out, OR if it's checked_out but within the retention window.
+    let orphan_visitors: Vec<(String, Option<String>)> = {
+        let mut stmt = match conn.prepare(
+            "SELECT v.id, v.photo_filename
+             FROM visitors v
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM visits vt
+                 WHERE vt.visitor_id = v.id
+                   AND (vt.status != 'checked_out'
+                        OR vt.check_out IS NULL
+                        OR vt.check_out >= ?1)
+             )",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("retention sweep: prepare failed: {}", e);
+                return PurgeResult::default();
+            }
+        };
+        stmt.query_map(params![cutoff], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map(|iter| iter.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    };
+
+    // Step 1: delete the old checked-out visits.
+    let visits_deleted = conn
+        .execute(
+            "DELETE FROM visits
+             WHERE status = 'checked_out'
+               AND check_out IS NOT NULL
+               AND check_out < ?1",
+            params![cutoff],
+        )
+        .unwrap_or_else(|e| {
+            tracing::error!("retention sweep: visits delete failed: {}", e);
+            0
+        });
+
+    // Step 2: delete the orphaned visitor rows.
+    let mut visitors_deleted = 0usize;
+    for (id, _) in &orphan_visitors {
+        match conn.execute("DELETE FROM visitors WHERE id = ?1", params![id]) {
+            Ok(n) => visitors_deleted += n,
+            Err(e) => {
+                tracing::error!(
+                    "retention sweep: visitor {} delete failed: {}",
+                    id,
+                    e
+                );
+            }
+        }
+    }
+
+    // Step 3: collect photo filenames so the caller can unlink them.
+    let photo_filenames = orphan_visitors
+        .into_iter()
+        .filter_map(|(_, photo)| photo)
+        .filter(|f| !f.is_empty() && f != "logo.png")
+        .collect();
+
+    PurgeResult {
+        visits_deleted,
+        visitors_deleted,
+        photo_filenames,
+    }
+}
+
 pub fn get_db_stats(db: &DbPool) -> (usize, usize, usize) {
     let conn = db.lock().unwrap();
     let hosts: usize = conn.query_row(

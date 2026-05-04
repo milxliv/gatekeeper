@@ -262,6 +262,36 @@ async fn main() -> anyhow::Result<()> {
                     .auth_attempts
                     .sweep(std::time::Duration::from_secs(900));
 
+                // Path A retention: purge checked-out visits + orphaned
+                // visitors after the configured window (default 8h).
+                let visit_hours: i64 =
+                    db::get_setting(&state.db, "visit_retention_hours")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(8);
+                if visit_hours > 0 {
+                    let res = db::purge_old_visits(&state.db, visit_hours);
+                    let mut photos_unlinked = 0usize;
+                    for filename in &res.photo_filenames {
+                        let path = state.photos_dir.join(filename);
+                        if std::fs::remove_file(&path).is_ok() {
+                            photos_unlinked += 1;
+                        }
+                    }
+                    if res.visits_deleted > 0
+                        || res.visitors_deleted > 0
+                        || photos_unlinked > 0
+                    {
+                        tracing::info!(
+                            "Visit retention sweep: purged {} visit(s), {} \
+                             orphan visitor(s), {} photo file(s) (window={}h)",
+                            res.visits_deleted,
+                            res.visitors_deleted,
+                            photos_unlinked,
+                            visit_hours
+                        );
+                    }
+                }
+
                 let promoted = db::promote_rescheduled_visits(&state.db);
                 if promoted > 0 {
                     tracing::info!(
