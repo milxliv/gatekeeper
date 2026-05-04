@@ -3,8 +3,10 @@ mod email;
 mod graph;
 mod graph_service;
 mod models;
+mod redirect;
 mod routes;
 mod templates;
+mod tls;
 
 use std::sync::Arc;
 use axum::{
@@ -384,36 +386,65 @@ async fn main() -> anyhow::Result<()> {
         ))
         .with_state(state.clone());
 
+    // ── TLS setup ──────────────────────────────────────────
+    let cert_path = std::path::PathBuf::from(
+        std::env::var("GATEKEEPER_TLS_CERT").unwrap_or_else(|_| "tls/cert.pem".to_string()),
+    );
+    let key_path = std::path::PathBuf::from(
+        std::env::var("GATEKEEPER_TLS_KEY").unwrap_or_else(|_| "tls/key.pem".to_string()),
+    );
+
+    match tls::ensure_self_signed(&cert_path, &key_path) {
+        Ok(true) => tracing::warn!(
+            "Generated new self-signed TLS cert at {} (valid for localhost + hostname). \
+             Browsers will show a warning until trusted; for production, replace with a \
+             Hearst-CA-signed cert at the same path.",
+            cert_path.display()
+        ),
+        Ok(false) => tracing::info!("Loaded existing TLS cert from {}", cert_path.display()),
+        Err(e) => return Err(anyhow::anyhow!("TLS cert setup failed: {e:?}")),
+    }
+
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
+
+    let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load TLS cert/key: {e}"))?;
+
     let port: u16 = std::env::var("GATEKEEPER_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
-        .unwrap_or(3000);
+        .unwrap_or(3443);
 
     let admin_port: u16 = std::env::var("GATEKEEPER_ADMIN_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
-        .unwrap_or(3001);
+        .unwrap_or(3444);
+
+    let http_redirect_port: u16 = std::env::var("GATEKEEPER_HTTP_REDIRECT_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(80);
+    if http_redirect_port > 0 {
+        redirect::spawn(http_redirect_port, port);
+    }
 
     let reception_addr = SocketAddr::from(([0, 0, 0, 0], port));
     let admin_addr = SocketAddr::from(([127, 0, 0, 1], admin_port));
 
+    tracing::info!("GateKeeper reception at https://localhost:{}", port);
     tracing::info!(
-        "GateKeeper reception at http://localhost:{}",
-        port
-    );
-    tracing::info!(
-        "GateKeeper admin at http://127.0.0.1:{} (localhost only)",
+        "GateKeeper admin at https://127.0.0.1:{} (localhost only)",
         admin_port
     );
 
-    let reception_listener =
-        tokio::net::TcpListener::bind(reception_addr).await?;
-    let admin_listener =
-        tokio::net::TcpListener::bind(admin_addr).await?;
-
     tokio::try_join!(
-        axum::serve(reception_listener, reception_app),
-        axum::serve(admin_listener, admin_app),
+        axum_server::bind_rustls(reception_addr, tls_config.clone())
+            .serve(reception_app.into_make_service()),
+        axum_server::bind_rustls(admin_addr, tls_config)
+            .serve(admin_app.into_make_service()),
     )?;
 
     Ok(())

@@ -25,3 +25,9 @@ hex = "0.4"
 argon2 = { version = "0.5", features = ["std"] }
 password-hash = { version = "0.5", features = ["rand_core"] }
 totp-rs = { version = "5", features = ["qr", "gen_secret"] }
+
+# Native TLS for browser ↔ server (auto self-signed on first run)
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = "0.23"
+rcgen = "0.13"
+gethostname = "0.5"
