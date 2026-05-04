@@ -128,6 +128,18 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         );"
     )?;
 
+    // TOTP backup codes — argon2-hashed, single-use. Generated 10 at a
+    // time alongside the TOTP secret. Used only as a recovery path when
+    // the admin's authenticator is lost.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS totp_backup_codes (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            code_hash  TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            used_at    TEXT
+        );"
+    )?;
+
     // Seed defaults (only if not already set)
     let defaults = [
         ("company_name", "WBBH"),
@@ -152,6 +164,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         ("badge_show_badge_number", "1"),
         ("badge_show_escort", "1"),
         ("photo_retention_hours", "24"),
+        ("visit_retention_hours", "8"),
         ("visitor_type_list", "Visitor,Guest,Contractor,Vendor,Interview"),
         ("badge_font_name_pt", "18"),
         ("badge_font_company_pt", "11"),
@@ -409,6 +422,99 @@ pub fn purge_old_visits(db: &DbPool, hours: i64) -> PurgeResult {
         visitors_deleted,
         photo_filenames,
     }
+}
+
+// ── TOTP backup codes ────────────────────────────────────────
+
+fn normalize_backup_code(presented: &str) -> String {
+    presented
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// Generate, hash, and store 10 fresh backup codes. Wipes any previously
+/// issued codes so each enrollment replaces the prior batch. Returns the
+/// 10 plaintext codes (formatted xxxx-xxxx) for one-time display to the
+/// admin — they are not retrievable after this call.
+pub fn rotate_backup_codes(db: &DbPool) -> Result<Vec<String>> {
+    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+    let conn = db.lock().unwrap();
+    conn.execute("DELETE FROM totp_backup_codes", [])?;
+    let argon = argon2::Argon2::default();
+    let mut codes = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let raw = uuid::Uuid::new_v4().simple().to_string();
+        let display_code = format!("{}-{}", &raw[..4], &raw[4..8]);
+        let normalized = normalize_backup_code(&display_code);
+        let salt = SaltString::generate(&mut OsRng);
+        let hash = argon
+            .hash_password(normalized.as_bytes(), &salt)
+            .map_err(|e| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    std::io::Error::other(e.to_string()),
+                ))
+            })?
+            .to_string();
+        conn.execute(
+            "INSERT INTO totp_backup_codes (code_hash) VALUES (?1)",
+            params![hash],
+        )?;
+        codes.push(display_code);
+    }
+    Ok(codes)
+}
+
+/// Verify a presented backup code (dashes/whitespace/case-insensitive) and
+/// mark it consumed if it matches an unused row. Returns true on match.
+pub fn consume_backup_code(db: &DbPool, presented: &str) -> bool {
+    use argon2::{Argon2, PasswordHash, PasswordVerifier};
+    let normalized = normalize_backup_code(presented);
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let conn = db.lock().unwrap();
+    let mut stmt = match conn.prepare(
+        "SELECT id, code_hash FROM totp_backup_codes WHERE used_at IS NULL",
+    ) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let rows: Vec<(i64, String)> =
+        match stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))) {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => return false,
+        };
+    drop(stmt);
+
+    let argon = Argon2::default();
+    for (id, hash) in &rows {
+        let parsed = match PasswordHash::new(hash) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if argon.verify_password(normalized.as_bytes(), &parsed).is_ok() {
+            let _ = conn.execute(
+                "UPDATE totp_backup_codes SET used_at = datetime('now') WHERE id = ?1",
+                params![id],
+            );
+            return true;
+        }
+    }
+    false
+}
+
+/// Count remaining unused backup codes — for "X codes left" warnings.
+pub fn backup_codes_remaining(db: &DbPool) -> usize {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM totp_backup_codes WHERE used_at IS NULL",
+        [],
+        |r| r.get::<_, i64>(0).map(|n| n as usize),
+    )
+    .unwrap_or(0)
 }
 
 pub fn get_db_stats(db: &DbPool) -> (usize, usize, usize) {

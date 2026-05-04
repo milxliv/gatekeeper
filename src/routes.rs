@@ -1554,20 +1554,18 @@ pub async fn api_admin_login(
                 .into_response();
             }
 
-            match build_totp(&secret_b32) {
+            // Try the TOTP code first (must be 6 digits). If it doesn't
+            // match, fall through to backup-code verification so the admin
+            // can still get in if their authenticator is lost.
+            let totp_ok = match build_totp(&secret_b32) {
                 Ok(totp) => {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
-                    if !totp.check(code, now) {
-                        state.auth_attempts.record_fail(&rl_key);
-                        return Html(templates::admin_login_page(
-                            Some("Invalid authenticator code. Try again."),
-                            true,
-                        ))
-                        .into_response();
-                    }
+                    code.len() == 6
+                        && code.chars().all(|c| c.is_ascii_digit())
+                        && totp.check(code, now)
                 }
                 Err(e) => {
                     tracing::error!("TOTP error: {}", e);
@@ -1577,9 +1575,31 @@ pub async fn api_admin_login(
                     ))
                     .into_response();
                 }
+            };
+
+            let backup_ok = !totp_ok && db::consume_backup_code(&state.db, code);
+
+            if !totp_ok && !backup_ok {
+                state.auth_attempts.record_fail(&rl_key);
+                return Html(templates::admin_login_page(
+                    Some("Invalid authenticator code or backup code."),
+                    true,
+                ))
+                .into_response();
             }
 
-            // Password + TOTP valid — create session
+            if backup_ok {
+                let remaining = db::backup_codes_remaining(&state.db);
+                tracing::warn!(
+                    source = %source,
+                    remaining = remaining,
+                    "Admin logged in with a backup code; {} remaining. \
+                     Rotate codes if running low.",
+                    remaining
+                );
+            }
+
+            // Password + (TOTP or backup) valid — create session
             return create_admin_session(&state, &headers).into_response();
         }
     }
@@ -1600,13 +1620,35 @@ pub async fn api_admin_login(
                 .into_response();
             }
 
+            // Generate 10 single-use backup codes alongside the secret.
+            // Fail closed: if backup-code generation fails, undo the secret
+            // save so we never end up with a TOTP enrollment that has no
+            // recovery path.
+            let backup_codes = match db::rotate_backup_codes(&state.db) {
+                Ok(codes) => codes,
+                Err(e) => {
+                    tracing::error!("Failed to generate backup codes: {}", e);
+                    let _ = db::set_setting(&state.db, "totp_secret", "");
+                    return Html(templates::admin_login_page(
+                        Some("Failed to set up MFA. Try again."),
+                        false,
+                    ))
+                    .into_response();
+                }
+            };
+
             let qr_uri = totp
                 .get_qr_base64()
                 .unwrap_or_else(|_| String::new());
             let qr_src = format!("data:image/png;base64,{}", qr_uri);
 
-            Html(templates::totp_setup_page(&qr_src, &secret_b32, None))
-                .into_response()
+            Html(templates::totp_setup_page(
+                &qr_src,
+                &secret_b32,
+                &backup_codes,
+                None,
+            ))
+            .into_response()
         }
         Err(e) => {
             tracing::error!("Failed to generate TOTP: {}", e);
@@ -1644,8 +1686,12 @@ pub async fn api_admin_totp_confirm(
                 .unwrap_or_default()
                 .as_secs();
             if !totp.check(code, now) {
-                // Invalid code — remove the secret so they can retry setup
+                // Invalid code — remove the secret + backup codes so
+                // they can retry setup with a fresh batch.
                 let _ = db::set_setting(&state.db, "totp_secret", "");
+                let conn = state.db.lock().unwrap();
+                let _ = conn.execute("DELETE FROM totp_backup_codes", []);
+                drop(conn);
                 let qr_uri = totp
                     .get_qr_base64()
                     .unwrap_or_else(|_| String::new());
@@ -1653,7 +1699,8 @@ pub async fn api_admin_totp_confirm(
                 return Html(templates::totp_setup_page(
                     &qr_src,
                     &secret_b32,
-                    Some("Invalid code. Scan the QR code again and retry."),
+                    &[],
+                    Some("Invalid code. Log in again to restart setup."),
                 ))
                 .into_response();
             }

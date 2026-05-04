@@ -2944,6 +2944,7 @@ body {{
 pub fn totp_setup_page(
     qr_data_uri: &str,
     secret: &str,
+    backup_codes: &[String],
     error: Option<&str>,
 ) -> String {
     let error_html = match error {
@@ -2953,6 +2954,34 @@ pub fn totp_setup_page(
             html_escape(msg)
         ),
         None => String::new(),
+    };
+
+    let backup_html = if backup_codes.is_empty() {
+        String::new()
+    } else {
+        let items: String = backup_codes
+            .iter()
+            .map(|c| {
+                format!(
+                    r#"<li style="font-family:monospace;font-size:1rem;padding:0.25rem 0;letter-spacing:0.1em;">{}</li>"#,
+                    html_escape(c)
+                )
+            })
+            .collect();
+        format!(
+            r#"<div style="background:#fef3c7;border:1px solid #f59e0b;
+            border-radius:8px;padding:1rem;margin-bottom:1.5rem;text-align:left;">
+                <h2 style="font-size:1rem;margin-bottom:0.5rem;color:#78350f;">
+                    ⚠ Save these backup codes now
+                </h2>
+                <p style="font-size:0.85rem;color:#78350f;margin-bottom:0.75rem;">
+                    Each code can be used once if you lose access to your
+                    authenticator. <strong>This page is the only time these
+                    will be shown.</strong> Print or copy them somewhere safe.
+                </p>
+                <ol style="margin-left:1.25rem;color:#374151;">{items}</ol>
+            </div>"#
+        )
     };
 
     format!(r#"<!DOCTYPE html>
@@ -3014,6 +3043,7 @@ body {{
     <p style="font-size:0.8rem;color:#666;margin-bottom:0.5rem;">
     Or enter this code manually:</p>
     <div class="secret-code">{secret}</div>
+    {backup_html}
     <form method="POST" action="/totp/confirm">
         <label for="code">Enter 6-digit code to confirm</label>
         <input type="text" name="code" id="code" inputmode="numeric"
@@ -3027,6 +3057,7 @@ body {{
         error = error_html,
         qr = qr_data_uri,
         secret = html_escape(secret),
+        backup_html = backup_html,
     )
 }
 
