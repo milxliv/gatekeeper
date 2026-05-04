@@ -1,11 +1,16 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse},
     Form, Json,
 };
+
+const LOGIN_MAX_ATTEMPTS: usize = 10;
+const LOGIN_WINDOW: Duration = Duration::from_secs(900); // 15 min
 use chrono::TimeZone;
 use serde::{Deserialize, Serialize};
 use crate::db;
@@ -37,11 +42,24 @@ pub struct LoginForm {
 
 pub async fn api_login(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> impl IntoResponse {
     if state.password_hash.is_none() {
         return axum::response::Redirect::to("/").into_response();
+    }
+
+    let source = addr.ip().to_string();
+    if !state
+        .auth_attempts
+        .allowed(&source, LOGIN_MAX_ATTEMPTS, LOGIN_WINDOW)
+    {
+        tracing::warn!(source = %source, "Reception login rate limit exceeded");
+        return Html(templates::login_page(Some(
+            "Too many login attempts. Wait 15 minutes and try again.",
+        )))
+        .into_response();
     }
 
     use argon2::{Argon2, PasswordVerifier, PasswordHash};
@@ -85,6 +103,7 @@ pub async fn api_login(
             ).into_response()
         }
         None => {
+            state.auth_attempts.record_fail(&source);
             Html(templates::login_page(Some("Invalid password."))).into_response()
         }
     }
@@ -224,9 +243,10 @@ pub async fn api_pre_register(
     let visitor_id = match db::find_or_create_visitor(&state.db, &visitor) {
         Ok(id) => id,
         Err(e) => {
-            return Html(templates::alert_error(
-                &format!("Database error: {}", e),
-            ))
+            return Html(templates::alert_error(&safe_error(
+                "Could not save visitor",
+                e,
+            )))
         }
     };
 
@@ -368,9 +388,10 @@ pub async fn api_walk_in(
     let visitor_id = match db::find_or_create_visitor(&state.db, &visitor) {
         Ok(id) => id,
         Err(e) => {
-            return Html(templates::alert_error(
-                &format!("Database error: {}", e),
-            ))
+            return Html(templates::alert_error(&safe_error(
+                "Could not save visitor",
+                e,
+            )))
         }
     };
 
@@ -966,7 +987,10 @@ pub async fn api_save_theme(
         _ => "system",
     };
     if let Err(e) = db::set_setting(&state.db, "ui_theme", theme) {
-        return Html(templates::alert_error(&format!("Failed: {}", e)));
+        return Html(templates::alert_error(&safe_error(
+            "Could not save theme",
+            e,
+        )));
     }
     // Return a script that reloads the page so the theme takes effect
     Html(format!(
@@ -995,7 +1019,10 @@ pub async fn api_save_dropdowns(
     ];
     for (key, val) in &pairs {
         if let Err(e) = db::set_setting(&state.db, key, val) {
-            return Html(templates::alert_error(&format!("Failed: {}", e)));
+            return Html(templates::alert_error(&safe_error(
+                "Could not save dropdown options",
+                e,
+            )));
         }
     }
     Html(templates::alert_success("Dropdown options saved."))
@@ -1325,6 +1352,20 @@ pub async fn api_upload_photo(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // Validate file content by magic bytes — never trust extension or
+    // content-type from the client. Only accept browser-camera image formats.
+    match infer::get(&body).map(|t| t.mime_type()) {
+        Some("image/jpeg") | Some("image/png") | Some("image/webp") => {}
+        other => {
+            tracing::warn!(
+                visitor_id = %visitor_id,
+                detected = ?other,
+                "Photo upload rejected: not a recognized image format"
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
     // Verify visitor exists
     let _exists = {
         let conn = state.db.lock().unwrap();
@@ -1339,11 +1380,15 @@ pub async fn api_upload_photo(
     let photos_dir = state.photos_dir.as_path();
     let filepath = photos_dir.join(&filename);
 
-    std::fs::write(&filepath, &body)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    std::fs::write(&filepath, &body).map_err(|e| {
+        tracing::error!(visitor_id = %visitor_id, "Photo write failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    db::set_visitor_photo(&state.db, &visitor_id, &filename)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    db::set_visitor_photo(&state.db, &visitor_id, &filename).map_err(|e| {
+        tracing::error!(visitor_id = %visitor_id, "Photo DB update failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     tracing::info!(visitor_id = %visitor_id, "Photo saved: {}", filename);
 
@@ -1449,10 +1494,28 @@ pub struct AdminLoginForm {
 
 pub async fn api_admin_login(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     Form(form): Form<AdminLoginForm>,
 ) -> impl IntoResponse {
     use argon2::{Argon2, PasswordVerifier, PasswordHash};
+
+    let source = addr.ip().to_string();
+    // Use a different bucket for the admin port so reception lockout doesn't
+    // bleed across; key includes the role so attackers can't share quota.
+    let rl_key = format!("admin:{}", source);
+    if !state
+        .auth_attempts
+        .allowed(&rl_key, LOGIN_MAX_ATTEMPTS, LOGIN_WINDOW)
+    {
+        tracing::warn!(source = %source, "Admin login rate limit exceeded");
+        let needs_totp = db::has_totp_secret(&state.db);
+        return Html(templates::admin_login_page(
+            Some("Too many login attempts. Wait 15 minutes and try again."),
+            needs_totp,
+        ))
+        .into_response();
+    }
 
     // Verify admin password
     let password_valid = if let Some(ref admin_hash) = state.admin_password_hash {
@@ -1469,6 +1532,7 @@ pub async fn api_admin_login(
     };
 
     if !password_valid {
+        state.auth_attempts.record_fail(&rl_key);
         let needs_totp = db::has_totp_secret(&state.db);
         return Html(templates::admin_login_page(
             Some("Invalid admin password."),
@@ -1497,6 +1561,7 @@ pub async fn api_admin_login(
                         .unwrap_or_default()
                         .as_secs();
                     if !totp.check(code, now) {
+                        state.auth_attempts.record_fail(&rl_key);
                         return Html(templates::admin_login_page(
                             Some("Invalid authenticator code. Try again."),
                             true,

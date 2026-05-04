@@ -3,6 +3,7 @@ mod email;
 mod graph;
 mod graph_service;
 mod models;
+mod rate_limit;
 mod redirect;
 mod routes;
 mod templates;
@@ -10,7 +11,7 @@ mod tls;
 
 use std::sync::Arc;
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::header,
     middleware,
     response::IntoResponse,
@@ -32,6 +33,7 @@ pub struct AppState {
     pub password_hash: Option<String>,
     pub admin_password_hash: Option<String>,
     pub kiosk_secret: Option<String>,
+    pub auth_attempts: Arc<rate_limit::AuthAttemptTracker>,
 }
 
 /// User role, injected into request extensions by auth middleware.
@@ -218,6 +220,7 @@ async fn main() -> anyhow::Result<()> {
         password_hash,
         admin_password_hash,
         kiosk_secret,
+        auth_attempts: Arc::new(rate_limit::AuthAttemptTracker::new()),
     });
 
     let promoted = db::promote_rescheduled_visits(&state.db);
@@ -254,6 +257,10 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 db::cleanup_expired_sessions(&state.db);
+
+                state
+                    .auth_attempts
+                    .sweep(std::time::Duration::from_secs(900));
 
                 let promoted = db::promote_rescheduled_visits(&state.db);
                 if promoted > 0 {
@@ -324,6 +331,7 @@ async fn main() -> anyhow::Result<()> {
             post(routes::api_upload_photo),
         )
         .route("/photos/:filename", get(routes::serve_photo))
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_reception_auth,
@@ -380,6 +388,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/hosts/search", get(routes::api_search_hosts))
         // Photos (needed for badge preview with logos)
         .route("/photos/:filename", get(routes::serve_photo))
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin_auth,
@@ -442,9 +451,9 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::try_join!(
         axum_server::bind_rustls(reception_addr, tls_config.clone())
-            .serve(reception_app.into_make_service()),
+            .serve(reception_app.into_make_service_with_connect_info::<SocketAddr>()),
         axum_server::bind_rustls(admin_addr, tls_config)
-            .serve(admin_app.into_make_service()),
+            .serve(admin_app.into_make_service_with_connect_info::<SocketAddr>()),
     )?;
 
     Ok(())

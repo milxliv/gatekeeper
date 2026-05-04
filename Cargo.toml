@@ -31,3 +31,6 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = "0.23"
 rcgen = "0.13"
 gethostname = "0.5"
+
+# Magic-byte file sniffing for photo upload validation
+infer = "0.16"
