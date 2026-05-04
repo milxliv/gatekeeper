@@ -15,8 +15,10 @@ cp .env.example .env
 
 # Run
 ./target/release/gatekeeper
-# → http://localhost:3000 (or GATEKEEPER_PORT if set)
+# → https://localhost:3443 (reception) + https://127.0.0.1:3444 (admin)
 ```
+
+A self-signed TLS cert is auto-generated on first run at `tls/cert.pem` and `tls/key.pem` (covering `localhost`, `127.0.0.1`, and the machine's hostname). Browsers will show a warning until the cert is trusted (see Deployment for the Windows cert-trust steps); to use a Hearst-CA-signed cert, just drop the PEM files in at the same path and restart.
 
 ## Configuration
 
@@ -28,9 +30,20 @@ Environment variables (set in `.env` or shell):
 | `GATEKEEPER_ADMIN_PASSWORD` | *(none)* | Admin login password (falls back to front desk pw) |
 | `GATEKEEPER_KIOSK_SECRET` | *(none)* | API key for kiosk check-in endpoint |
 | `GATEKEEPER_DB` | `gatekeeper.db` | Path to SQLite database file |
-| `GATEKEEPER_PORT` | `3000` | HTTP port |
+| `GATEKEEPER_PORT` | `3443` | Reception HTTPS port |
+| `GATEKEEPER_ADMIN_PORT` | `3444` | Admin HTTPS port (loopback only, `127.0.0.1`) |
+| `GATEKEEPER_HTTP_REDIRECT_PORT` | `80` | Port for the HTTP→HTTPS redirect listener (`0` to disable) |
+| `GATEKEEPER_TLS_CERT` | `tls/cert.pem` | Path to TLS cert (auto-generated if missing) |
+| `GATEKEEPER_TLS_KEY` | `tls/key.pem` | Path to TLS key (auto-generated if missing) |
 | `GATEKEEPER_PHOTOS` | `photos` | Directory for visitor photos and logos |
 | `RUST_LOG` | `info` | Log level (error, warn, info, debug, trace) |
+
+Two retention settings live in the DB (admin panel or `settings` table), not env vars:
+
+| Setting key | Default | Description |
+|---|---|---|
+| `photo_retention_hours` | `24` | Hours to retain visitor photos before sweep deletes them |
+| `visit_retention_hours` | `8` | Hours after check-out before the visit row + orphan visitor are purged (Path A minimization) |
 
 ### Microsoft Graph Integration (Optional)
 
@@ -50,15 +63,17 @@ For O365 calendar events and email notifications via Graph API, see `.env.exampl
 │  ├── Admin Panel      — settings, badge branding, email      │
 │  └── Badge Printing   — thermal badge generation (4"x2.4")  │
 └─────────────────────────┬────────────────────────────────────┘
-                          │ HTTP (no JS framework, no WebSocket)
+                          │ HTTPS (TLS 1.2+, rustls; HTTP→HTTPS 308 on :80)
 ┌─────────────────────────┴────────────────────────────────────┐
-│  Axum (Rust)                                                  │
-│  ├── Auth middleware    → session-based, role-aware           │
-│  ├── Page routes        → full HTML responses                 │
-│  ├── API routes         → HTMX partial HTML fragments         │
+│  Axum (Rust) — dual-port                                      │
+│  ├── Reception :3443    → 0.0.0.0, front-desk LAN access      │
+│  ├── Admin     :3444    → 127.0.0.1 loopback only             │
+│  ├── Auth middleware    → session + argon2, role-aware, TOTP  │
+│  ├── Rate limit         → 10 login attempts / 15 min per IP   │
+│  ├── Body cap           → 16 MB max request body              │
+│  ├── Photo upload       → magic-byte validated (PNG/JPEG/WebP)│
 │  ├── Kiosk API          → JSON endpoint for tablet check-in   │
-│  ├── Templates          → inline Rust, zero template engine   │
-│  └── SQLite (WAL mode)  → crash-safe, offline-first           │
+│  └── SQLite (WAL mode)  → crash-safe, retention-pruned        │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -71,7 +86,32 @@ Two-tier role system:
 
 If only `GATEKEEPER_PASSWORD` is set, it grants admin access. If neither is set, the app runs without authentication (dev mode).
 
-Sessions use HttpOnly cookies with argon2-hashed passwords. The `Secure` flag is applied automatically when behind HTTPS (e.g., Cloudflare Tunnel).
+Sessions use HttpOnly cookies with argon2-hashed passwords. The `Secure` flag is applied automatically when behind HTTPS (always the case in v0.3.0+).
+
+### Admin MFA (TOTP)
+
+The admin port (`/login` on `:3444`) requires both the admin password and a TOTP code from Microsoft Authenticator, Google Authenticator, Authy, or any RFC 6238-compatible app. On the first admin login, GateKeeper generates a TOTP secret + 10 single-use **backup codes** and shows them once on the setup page — print or copy them somewhere safe. They are argon2-hashed and never recoverable from the DB after that page.
+
+At login, the same code field accepts either:
+- A 6-digit TOTP code from the authenticator, or
+- An 8-character backup code (`xxxx-xxxx`) — case-insensitive, dashes/spaces optional.
+
+Backup codes are marked consumed on use; a warning is logged with the remaining count.
+
+### Recovering a lost authenticator
+
+If the admin loses both their phone and their backup codes, an engineer with shell access to the host can reset MFA:
+
+```
+# Stop the GateKeeper service first.
+sqlite3 gatekeeper.db <<SQL
+DELETE FROM settings WHERE key = 'totp_secret';
+DELETE FROM totp_backup_codes;
+SQL
+# Restart the service. The next admin login generates a fresh secret + new backup codes.
+```
+
+This is the documented recovery path; it requires physical/console access and does not depend on email or SMS.
 
 ## Visit Workflow
 
@@ -138,14 +178,21 @@ pending → approved → checked_in → checked_out
 
 ## Security
 
-- Argon2 password hashing (salted, timing-safe)
-- HttpOnly session cookies with SameSite=Lax
-- Secure flag auto-applied behind HTTPS
-- HTML escaping on all user-controlled template output
-- Parameterized SQL queries (no SQL injection)
-- Kiosk API protected by shared secret header
-- Internal error details logged server-side, not exposed to users
-- Photo path traversal protection
+- **Native TLS (rustls)** on both reception and admin ports — no plaintext on the wire. Auto-generated self-signed cert on first run; replaceable with a Hearst-CA-signed cert at the same path.
+- **HTTP→HTTPS redirect** on `:80` (308) so cleartext URLs land on the secure port.
+- **Admin port loopback-only** (`127.0.0.1:3444`) — never reachable from the LAN; you must be on the HP mini console (or use SSH port-forwarding) to admin.
+- **Argon2 password hashing** for both reception and admin passwords (salted, timing-safe).
+- **TOTP MFA on admin port** with 10 single-use backup codes; password+TOTP both required. See [Admin MFA](#admin-mfa-totp).
+- **Login rate limit** — 10 attempts per 15-minute sliding window, per source IP, on each `/login` (reception + admin separately namespaced). Successful logins do not consume budget.
+- **HttpOnly + Secure session cookies** with SameSite=Lax.
+- **Request body cap** at 16 MB on both routers (DefaultBodyLimit).
+- **Photo upload validated by file magic bytes** (`infer` crate) — only PNG / JPEG / WebP accepted; extension and `Content-Type` headers are not trusted.
+- **Photo path-traversal protection** on `/photos/:filename`.
+- **Parameterized SQL queries everywhere** (`rusqlite ?` placeholders).
+- **HTML escaping** on all user-controlled template output (XSS defense).
+- **Sanitized error responses** — `rusqlite` errors are logged server-side via `tracing::error!`; users see a generic retry message.
+- **Kiosk API** protected by `X-Kiosk-Secret` shared-secret header.
+- **Path A retention sweep** — visitor PII (name, phone, email, photo) auto-purged from local SQLite ~8 hours after check-out. The host's M365 calendar event (Graph API) remains as the canonical long-term audit trail.
 
 ## Tech Stack
 
@@ -165,22 +212,36 @@ pending → approved → checked_in → checked_out
 
 ```bash
 cargo run
+# → https://localhost:3443 (reception), https://127.0.0.1:3444 (admin)
 ```
 
-### Cloudflare Tunnel (temporary)
+### Lobby HP mini (Windows 11 Pro, primary deployment target)
 
-```bash
-cloudflared tunnel --url http://localhost:3006
-```
+1. **BitLocker** the system drive with the recovery key escrowed to Hearst Azure (Intune-managed). This is the encryption-at-rest control for the local SQLite DB and photos directory.
+2. **Intune-enroll** the device so it's part of the governed perimeter.
+3. Drop the GateKeeper binary in `C:\Program Files\GateKeeper\gatekeeper.exe` and create a working dir at `C:\ProgramData\GateKeeper\`.
+4. **Trust the auto-generated self-signed cert** in the Windows certificate store (required so Edge/Chrome will allow `getUserMedia()` for the USB camera). From elevated PowerShell:
 
-### Cloudflare Tunnel (named, persistent)
+   ```powershell
+   Import-Certificate -FilePath "C:\ProgramData\GateKeeper\tls\cert.pem" `
+                      -CertStoreLocation Cert:\LocalMachine\Root
+   ```
+
+   Or push the cert via Intune/GPO so it lands silently. Replacing `tls\cert.pem` and `tls\key.pem` with a Hearst-CA-signed cert at any time avoids the trust step.
+5. **Firewall**: allow inbound on 443/3443 and 80; deny inbound on 3000/3001 (the old non-TLS ports).
+6. Register as a Windows service running under a constrained service account (not LocalSystem). Service auto-starts on boot.
+7. Receptionist double-clicks a desktop shortcut to `https://localhost:3443/`.
+
+### Cloudflare Tunnel (named, persistent — optional)
 
 ```bash
 cloudflared tunnel login
 cloudflared tunnel create gatekeeper
 cloudflared tunnel route dns gatekeeper gatekeeper.yourdomain.com
-cloudflared tunnel run --url http://localhost:3006 gatekeeper
+cloudflared tunnel run --url https://localhost:3443 gatekeeper
 ```
+
+Cloudflare Tunnel terminates TLS at the edge; the local TLS cert covers the loopback hop.
 
 ## License
 
