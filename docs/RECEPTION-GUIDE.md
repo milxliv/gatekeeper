@@ -103,7 +103,7 @@ When someone arrives without a pre-registration:
 For a tour group or team of visitors arriving together:
 
 1. Click **Group Visit** in the sidebar
-2. Enter the group name (e.g., "Florida Tech Tour")
+2. Enter the group name (e.g., "Local College Tour")
 3. Add each person's name and company
 4. Select one host for the group
 5. Submit — each person gets their own badge to print

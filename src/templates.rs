@@ -2008,7 +2008,7 @@ pub fn admin_page(
                     <div class="form-group full">
                         <label>Custom Footer Text</label>
                         <input type="text" name="badge_footer_text" value="{badge_footer_text}"
-                               placeholder="e.g. Fort Myers, FL — Building A">
+                               placeholder="e.g. City, ST — Building A">
                     </div>
                     <div class="form-group full">
                         <label>Badge Fields</label>
