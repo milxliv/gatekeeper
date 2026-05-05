@@ -47,10 +47,6 @@ Two retention settings live in the DB (admin panel or `settings` table), not env
 | `photo_retention_hours` | `24` | Hours to retain visitor photos before sweep deletes them |
 | `visit_retention_hours` | `8` | Hours after check-out before the visit row + orphan visitor are purged (Path A minimization) |
 
-### Microsoft Graph Integration (Optional)
-
-For O365 calendar events and email notifications via Graph API, see `.env.example` for `GRAPH_*` variables and Azure AD setup instructions.
-
 ## Architecture
 
 ```
@@ -62,7 +58,7 @@ For O365 calendar events and email notifications via Graph API, see `.env.exampl
 │  ├── Group Visit      — register tour/school groups          │
 │  ├── Hosts            — manage staff notification targets    │
 │  ├── Visitor Log      — searchable history + date filter     │
-│  ├── Admin Panel      — settings, badge branding, email      │
+│  ├── Admin Panel      — settings, badge branding, dropdowns  │
 │  └── Badge Printing   — thermal badge generation (4"x2.4")  │
 └─────────────────────────┬────────────────────────────────────┘
                           │ HTTPS (TLS 1.2+, rustls; HTTP→HTTPS 308 on :80)
@@ -84,7 +80,7 @@ For O365 calendar events and email notifications via Graph API, see `.env.exampl
 Two-tier role system:
 
 - **Front desk** (`GATEKEEPER_PASSWORD`) — Dashboard, check-in/out, pre-register, walk-in, group visits, visitor log
-- **Admin** (`GATEKEEPER_ADMIN_PASSWORD`) — All of the above plus settings, badge branding, host management, email config
+- **Admin** (`GATEKEEPER_ADMIN_PASSWORD`) — All of the above plus settings, badge branding, host management, dropdown configuration
 
 If only `GATEKEEPER_PASSWORD` is set, it grants admin access. If neither is set, the app runs without authentication (dev mode).
 
@@ -124,7 +120,7 @@ Pre-Registered Path:
 
 Walk-In Path:
   Unknown visitor arrives → Front desk enters info
-  → Host gets alert (email) → Host approves/denies
+  → Receptionist notifies host → Host approves/denies
   → Check in on approval → Photo + Badge → Check out
 
 Group Visit Path:
@@ -149,7 +145,7 @@ pending → approved → checked_in → checked_out
 - **/group-visit** — Register tour groups, school visits, or large parties
 - **/hosts** — Add/edit/remove staff who receive visitor notifications
 - **/log** — Full searchable visitor history with date range filtering
-- **/admin** — General settings, badge branding, email config, dropdown options
+- **/admin** — General settings, badge branding, dropdown options
 - **/badge/:id** — Printable visitor badge (4"x2.4" thermal label format)
 
 ## Features
@@ -158,7 +154,7 @@ pending → approved → checked_in → checked_out
 - [x] Full CRUD for hosts, visitors, and visits
 - [x] HTMX dashboard with 30-second auto-refresh
 - [x] Pre-registration workflow
-- [x] Walk-in workflow with email notifications
+- [x] Walk-in workflow with host approval gate
 - [x] Group visit registration with bulk badge printing
 - [x] Approve / Deny / Check-In / Check-Out / Reschedule / Late actions
 - [x] Bulk "Check Out All" for end-of-day
@@ -169,9 +165,7 @@ pending → approved → checked_in → checked_out
 - [x] Customizable badge branding (colors, logo, fonts, escort flag)
 - [x] Role-based access control (front desk vs admin)
 - [x] Session-based auth with argon2 password hashing
-- [x] Admin panel (general settings, badge config, email, dropdowns)
-- [x] Microsoft Graph calendar integration (optional)
-- [x] Email notifications via Graph API (host arrival, visitor confirmation)
+- [x] Admin panel (general settings, badge config, dropdowns)
 - [x] Kiosk JSON API with shared secret auth
 - [x] XSS protection (HTML escaping on all user-controlled output)
 - [x] Sanitized error messages (no DB internals exposed to users)
@@ -194,7 +188,7 @@ pending → approved → checked_in → checked_out
 - **HTML escaping** on all user-controlled template output (XSS defense).
 - **Sanitized error responses** — `rusqlite` errors are logged server-side via `tracing::error!`; users see a generic retry message.
 - **Kiosk API** protected by `X-Kiosk-Secret` shared-secret header.
-- **Path A retention sweep** — visitor PII (name, phone, email, photo) auto-purged from local SQLite ~8 hours after check-out. The host's M365 calendar event (Graph API) remains as the canonical long-term audit trail.
+- **Aggressive PII minimization** — visitor photos are unlinked from disk **at the moment the visitor checks out** (default `photo_retention_hours = 0`); the visit row itself + any orphaned visitor row + photo are purged ~8 hours after check-out by the background sweep (`visit_retention_hours`). No long-term local audit trail by design — if your business needs longer retention for compliance, raise the two retention settings in the admin panel.
 
 ## Tech Stack
 
@@ -205,19 +199,35 @@ pending → approved → checked_in → checked_out
 | Frontend | HTMX + plain CSS | No JS build, no npm |
 | Templates | Inline Rust strings | No template engine dependency |
 | Auth | Argon2 + sessions | Industry-standard password hashing |
-| Email | Microsoft Graph API | Enterprise O365 integration |
-| Calendar | Microsoft Graph API | Shared mailbox calendar events |
 
 ## Deployment
 
-### Local
+GateKeeper supports two physical layouts. The code is the same; only where the binary runs differs.
+
+### Layout A — All-in-one lobby PC
+
+Reception PC runs the GateKeeper binary, has the USB camera and badge printer attached, and the receptionist uses Edge/Chrome on the same machine to drive it. Simplest install. No network hop. Cert is trusted on `localhost` automatically.
+
+### Layout B — Server + thin-client reception PC (recommended for multi-receptionist or remote-admin environments)
+
+GateKeeper runs on a server somewhere on the LAN (a NUC in a rack, a Windows mini in IT, a VM, anything). The reception PC is just a browser pointed at `https://<server>:3443/`. The reception PC's USB camera and badge printer are accessed via the browser (`getUserMedia()` for camera, browser print dialog for printer) — no GateKeeper code runs locally on the reception PC.
+
+This means:
+
+- **No PII at rest on the reception PC ever.** The DB and photo files live on the server, not the lobby workstation.
+- **Multiple reception PCs** can hit the same server (busy lobbies, multiple entrances).
+- **Server can be hardened/admin-managed separately** from the public-facing reception machine.
+
+Both layouts work the same operationally. Layout B requires the reception PC to trust the server's TLS cert (otherwise `getUserMedia()` is blocked) — push the cert via GPO/MDM or import manually.
+
+### Local development
 
 ```bash
 cargo run
 # → https://localhost:3443 (reception), https://127.0.0.1:3444 (admin)
 ```
 
-### Windows lobby PC (primary deployment target)
+### Windows lobby PC (Layout A or as the reception thin-client in Layout B)
 
 Tested on Windows 11 Pro mini PCs. The same steps apply on Windows Server.
 
