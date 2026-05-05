@@ -1125,7 +1125,7 @@ impl BadgeSettings {
     fn load(db: &db::DbPool) -> Self {
         Self {
             company: db::get_setting(db, "company_name")
-                .unwrap_or_else(|| "WBBH".to_string()),
+                .unwrap_or_else(|| "Your Company".to_string()),
             expiry: db::get_setting(db, "badge_expiry_text")
                 .unwrap_or_else(|| "VALID TODAY ONLY".to_string()),
             color: db::get_setting(db, "badge_primary_color")

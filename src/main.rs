@@ -437,7 +437,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(true) => tracing::warn!(
             "Generated new self-signed TLS cert at {} (valid for localhost + hostname). \
              Browsers will show a warning until trusted; for production, replace with a \
-             Hearst-CA-signed cert at the same path.",
+             CA-signed cert at the same path.",
             cert_path.display()
         ),
         Ok(false) => tracing::info!("Loaded existing TLS cert from {}", cert_path.display()),
@@ -497,29 +497,25 @@ fn seed_demo_data(pool: &db::DbPool) {
 
     tracing::info!("Seeding demo host data...");
 
+    // Generic placeholder hosts so the dashboard isn't empty on first run.
+    // Replace these in the admin panel before going live.
     let demo_hosts = vec![
         models::NewHost {
-            name: "Adam (Engineering)".to_string(),
-            department: "Engineering".to_string(),
-            email: "engineering@wbbh.com".to_string(),
-            phone: None,
-        },
-        models::NewHost {
             name: "Front Desk".to_string(),
+            department: "Reception".to_string(),
+            email: "frontdesk@example.com".to_string(),
+            phone: None,
+        },
+        models::NewHost {
+            name: "Engineering".to_string(),
+            department: "Engineering".to_string(),
+            email: "engineering@example.com".to_string(),
+            phone: None,
+        },
+        models::NewHost {
+            name: "Operations Manager".to_string(),
             department: "Management".to_string(),
-            email: "frontdesk@wbbh.com".to_string(),
-            phone: None,
-        },
-        models::NewHost {
-            name: "News Director".to_string(),
-            department: "News".to_string(),
-            email: "news@wbbh.com".to_string(),
-            phone: None,
-        },
-        models::NewHost {
-            name: "Sales Manager".to_string(),
-            department: "Sales".to_string(),
-            email: "sales@wbbh.com".to_string(),
+            email: "operations@example.com".to_string(),
             phone: None,
         },
     ];

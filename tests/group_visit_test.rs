@@ -65,7 +65,7 @@ fn seed_host(db: &Arc<Mutex<Connection>>) -> String {
     let conn = db.lock().unwrap();
     conn.execute(
         "INSERT INTO hosts (id, name, department, email) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![id, "Front Desk", "Management", "frontdesk@wbbh.com"],
+        rusqlite::params![id, "Front Desk", "Management", "frontdesk@example.com"],
     ).unwrap();
     id
 }

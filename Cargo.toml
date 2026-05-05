@@ -1,8 +1,9 @@
 [package]
 name = "gatekeeper"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "WBBH Visitor Management System"
+description = "Self-hosted, offline-capable visitor management for any small to mid-size business"
+license = "MIT"
 
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }

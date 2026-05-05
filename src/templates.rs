@@ -531,7 +531,7 @@ pub fn layout_with_theme(title: &str, content: &str, theme: &str) -> String {
     <div class="shell">
         <aside class="sidebar">
             <h1>⛊ GateKeeper</h1>
-            <div class="subtitle">WBBH Visitor Management</div>
+            <div class="subtitle">Visitor Management</div>
             <nav>
                 {sidebar_nav}
             </nav>
@@ -1403,7 +1403,7 @@ pub fn hosts_page(hosts: &[Host]) -> String {
                     </div>
                     <div class="form-group">
                         <label>Email *</label>
-                        <input type="email" name="email" id="host-email" required placeholder="name@wbbh.com">
+                        <input type="email" name="email" id="host-email" required placeholder="name@example.com">
                     </div>
                     <div class="form-group">
                         <label>Phone (for SMS alerts)</label>

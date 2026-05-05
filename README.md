@@ -1,8 +1,10 @@
-# GateKeeper V2 — WBBH Visitor Management System
+# GateKeeper — Visitor Management System
 
-**Self-hosted, offline-capable visitor management for broadcast facilities.**
+**Self-hosted, offline-capable visitor management for any small to mid-size business.**
 
 Zero subscriptions. Zero npm. Zero cloud dependency. One Rust binary + SQLite.
+
+Built originally for a broadcast lobby; works for any front desk that needs to register, badge, and log visitors.
 
 ## Quick Start
 
@@ -18,7 +20,7 @@ cp .env.example .env
 # → https://localhost:3443 (reception) + https://127.0.0.1:3444 (admin)
 ```
 
-A self-signed TLS cert is auto-generated on first run at `tls/cert.pem` and `tls/key.pem` (covering `localhost`, `127.0.0.1`, and the machine's hostname). Browsers will show a warning until the cert is trusted (see Deployment for the Windows cert-trust steps); to use a Hearst-CA-signed cert, just drop the PEM files in at the same path and restart.
+A self-signed TLS cert is auto-generated on first run at `tls/cert.pem` and `tls/key.pem` (covering `localhost`, `127.0.0.1`, and the machine's hostname). Browsers will show a warning until the cert is trusted (see Deployment for the Windows cert-trust steps); to use a CA-signed cert from your organization, just drop the PEM files in at the same path and restart.
 
 ## Configuration
 
@@ -178,7 +180,7 @@ pending → approved → checked_in → checked_out
 
 ## Security
 
-- **Native TLS (rustls)** on both reception and admin ports — no plaintext on the wire. Auto-generated self-signed cert on first run; replaceable with a Hearst-CA-signed cert at the same path.
+- **Native TLS (rustls)** on both reception and admin ports — no plaintext on the wire. Auto-generated self-signed cert on first run; replaceable with a CA-signed cert at the same path.
 - **HTTP→HTTPS redirect** on `:80` (308) so cleartext URLs land on the secure port.
 - **Admin port loopback-only** (`127.0.0.1:3444`) — never reachable from the LAN; you must be on the HP mini console (or use SSH port-forwarding) to admin.
 - **Argon2 password hashing** for both reception and admin passwords (salted, timing-safe).
@@ -215,10 +217,12 @@ cargo run
 # → https://localhost:3443 (reception), https://127.0.0.1:3444 (admin)
 ```
 
-### Lobby HP mini (Windows 11 Pro, primary deployment target)
+### Windows lobby PC (primary deployment target)
 
-1. **BitLocker** the system drive with the recovery key escrowed to Hearst Azure (Intune-managed). This is the encryption-at-rest control for the local SQLite DB and photos directory.
-2. **Intune-enroll** the device so it's part of the governed perimeter.
+Tested on Windows 11 Pro mini PCs. The same steps apply on Windows Server.
+
+1. **Enable BitLocker** on the system drive with the recovery key escrowed to your IT system (Azure / AD / your password manager). This is the encryption-at-rest control for the local SQLite DB and photos directory.
+2. (Optional but recommended) **Enroll the device** in your MDM (Intune, Jamf-for-Windows, etc.) for remote management and remote wipe.
 3. Drop the GateKeeper binary in `C:\Program Files\GateKeeper\gatekeeper.exe` and create a working dir at `C:\ProgramData\GateKeeper\`.
 4. **Trust the auto-generated self-signed cert** in the Windows certificate store (required so Edge/Chrome will allow `getUserMedia()` for the USB camera). From elevated PowerShell:
 
@@ -227,8 +231,8 @@ cargo run
                       -CertStoreLocation Cert:\LocalMachine\Root
    ```
 
-   Or push the cert via Intune/GPO so it lands silently. Replacing `tls\cert.pem` and `tls\key.pem` with a Hearst-CA-signed cert at any time avoids the trust step.
-5. **Firewall**: allow inbound on 443/3443 and 80; deny inbound on 3000/3001 (the old non-TLS ports).
+   Or push the cert via GPO/MDM so it lands silently. Replacing `tls\cert.pem` and `tls\key.pem` with a CA-signed cert from your organization at any time avoids the trust step.
+5. **Firewall**: allow inbound on 443/3443 and 80; deny inbound on 3000/3001 (older non-TLS ports).
 6. Register as a Windows service running under a constrained service account (not LocalSystem). Service auto-starts on boot.
 7. Receptionist double-clicks a desktop shortcut to `https://localhost:3443/`.
 
@@ -245,4 +249,6 @@ Cloudflare Tunnel terminates TLS at the edge; the local TLS cert covers the loop
 
 ## License
 
-Internal use — WBBH Engineering
+[MIT](LICENSE) — Copyright © 2026 Adam Lancaster.
+
+You're free to use, modify, and redistribute GateKeeper, including for commercial use, as long as the copyright notice and license remain intact. No warranty.

@@ -35,7 +35,7 @@ pub fn ensure_self_signed(cert_path: &Path, key_path: &Path) -> Result<bool> {
         CertificateParams::new(sans).context("creating cert params")?;
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, format!("GateKeeper ({hostname})"));
-    dn.push(DnType::OrganizationName, "WBBH Engineering");
+    dn.push(DnType::OrganizationName, "GateKeeper");
     params.distinguished_name = dn;
 
     let key_pair = KeyPair::generate().context("generating key pair")?;

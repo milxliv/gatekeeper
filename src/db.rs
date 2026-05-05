@@ -142,7 +142,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
     // Seed defaults (only if not already set)
     let defaults = [
-        ("company_name", "WBBH"),
+        ("company_name", "Your Company"),
         ("company_subtitle", "Visitor Management"),
         ("timezone", "Eastern Standard Time"),
         ("receptionist_email", ""),
