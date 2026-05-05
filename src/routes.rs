@@ -596,12 +596,15 @@ pub async fn api_checkin_visit(
     Html("<tr><td colspan='9'>Checked in</td></tr>".to_string())
 }
 
-/// Check out a visitor
+/// Check out a visitor — and immediately purge any photo whose visitor
+/// no longer has an active visit (privacy minimization: visitor PII
+/// disappears as soon as they leave the lobby).
 pub async fn api_checkout_visit(
     State(state): State<Arc<AppState>>,
     Path(visit_id): Path<String>,
 ) -> Html<String> {
     let _ = db::check_out_visit(&state.db, &visit_id);
+    purge_expired_photos(&state);
     if let Ok(visits) = db::list_visits_today(&state.db) {
         if let Some(v) = visits.iter().find(|v| v.id == visit_id) {
             return Html(templates::visit_row_partial(v));
@@ -615,6 +618,7 @@ pub async fn api_checkout_all(
     State(state): State<Arc<AppState>>,
 ) -> Html<String> {
     let _ = db::check_out_all_today(&state.db);
+    purge_expired_photos(&state);
     let visits = db::list_visits_today(&state.db).unwrap_or_default();
     let rows = if visits.is_empty() {
         "<p style='color:var(--text-dim);padding:1rem;'>No visitors today.</p>"
@@ -623,6 +627,19 @@ pub async fn api_checkout_all(
         render_full_table(&visits, true)
     };
     Html(rows)
+}
+
+/// Trigger the same photo-cleanup logic the hourly sweep runs, but
+/// inline so checkouts unlink the photo without waiting up to an hour.
+fn purge_expired_photos(state: &AppState) {
+    let retention_hours: i64 = db::get_setting(&state.db, "photo_retention_hours")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let files = db::expired_photo_filenames(&state.db, retention_hours);
+    for filename in &files {
+        let _ = std::fs::remove_file(state.photos_dir.join(filename));
+    }
+    db::clear_expired_photos(&state.db, retention_hours);
 }
 
 /// Search the visitor log

@@ -156,7 +156,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         ("badge_show_areas", "1"),
         ("badge_show_badge_number", "1"),
         ("badge_show_escort", "1"),
-        ("photo_retention_hours", "24"),
+        ("photo_retention_hours", "0"),
         ("visit_retention_hours", "8"),
         ("visitor_type_list", "Visitor,Guest,Contractor,Vendor,Interview"),
         ("badge_font_name_pt", "18"),
