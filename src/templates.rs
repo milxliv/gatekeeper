@@ -875,18 +875,11 @@ fn sidebar_nav() -> String {
 pub fn dashboard_page(
     visits: &[VisitDetail],
     upcoming: &[VisitDetail],
-    graph_connected: bool,
 ) -> String {
     let total = visits.len();
     let checked_in = visits.iter().filter(|v| v.status == "checked_in").count();
     let pending = visits.iter().filter(|v| v.status == "pending").count();
     let walk_ins = visits.iter().filter(|v| !v.pre_registered).count();
-
-    let calendar_badge = if graph_connected {
-        r#"<span style="color:var(--green);font-weight:600;">Connected</span>"#
-    } else {
-        r#"<span style="color:var(--text-dim);">Disabled</span>"#
-    };
 
     let stats = format!(r##"
         <div class="stats">
@@ -894,7 +887,6 @@ pub fn dashboard_page(
             <div class="stat"><div class="label">Currently On-Site</div><div class="value" style="color:var(--green)">{checked_in}</div></div>
             <div class="stat"><div class="label">Expected</div><div class="value" style="color:var(--text-dim)">{pending}</div></div>
             <div class="stat"><div class="label">Walk-Ins</div><div class="value" style="color:var(--orange)">{walk_ins}</div></div>
-            <div class="stat"><div class="label">Calendar</div><div class="value" style="font-size:0.95rem;">{calendar_badge}</div></div>
         </div>
     "##);
 
@@ -1804,7 +1796,6 @@ pub fn admin_page(
     settings: &[(String, String)],
     hosts: &[Host],
     stats: (usize, usize, usize),
-    graph_status: &str,
 ) -> String {
     let (host_count, visitor_count, visit_count) = stats;
 
@@ -1827,12 +1818,6 @@ pub fn admin_page(
         )
     }).collect();
 
-    let graph_badge = match graph_status {
-        "connected" => r#"<span class="badge checked_in">Connected</span>"#,
-        "disabled" => r#"<span class="badge denied">Disabled — credentials not set</span>"#,
-        _ => r#"<span class="badge pending">Unknown</span>"#,
-    };
-
     let content = format!(r##"
         <h2>Admin Panel</h2>
 
@@ -1849,10 +1834,6 @@ pub fn admin_page(
             <div class="stat">
                 <div class="label">Total Visits</div>
                 <div class="value">{visit_count}</div>
-            </div>
-            <div class="stat">
-                <div class="label">Calendar</div>
-                <div class="value" style="font-size:0.9rem;">{graph_badge}</div>
             </div>
         </div>
 
@@ -2085,21 +2066,6 @@ pub fn admin_page(
         }});
         </script>
 
-        <!-- Calendar / Graph API -->
-        <div class="card">
-            <h3>Microsoft 365 Calendar Integration</h3>
-            <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem;">
-                <span>Status:</span> {graph_badge}
-            </div>
-            <p style="color:var(--text-dim);font-size:0.85rem;">
-                Calendar and email credentials are configured via environment variables
-                in the <code>.env</code> file for security. Set <code>GRAPH_TENANT_ID</code>,
-                <code>GRAPH_CLIENT_ID</code>, <code>GRAPH_CLIENT_SECRET</code>,
-                <code>GRAPH_GROUP_ID</code>, and <code>GRAPH_GROUP_EMAIL</code>,
-                then restart GateKeeper.
-            </p>
-        </div>
-
         <!-- Host Management -->
         <div class="card">
             <h3>Hosts ({host_count})</h3>
@@ -2112,45 +2078,10 @@ pub fn admin_page(
             </div>
         </div>
 
-        <!-- Email Settings -->
-        <div class="card">
-            <h3>Email Notifications</h3>
-            <p style="color:var(--text-dim);font-size:0.85rem;margin-bottom:1rem;">
-                Sends email via Microsoft Graph API (same credentials as Calendar above).
-                Requires <strong>Mail.Send</strong> application permission in your Azure app registration.
-            </p>
-            <form hx-post="/admin/settings/smtp" hx-target="#smtp-result" hx-swap="innerHTML">
-                <div id="smtp-result"></div>
-                <div class="form-grid">
-                    <div class="form-group">
-                        <label>From Address (must be a mailbox in your O365 tenant)</label>
-                        <input type="email" name="smtp_from_address" value="{smtp_from_address}"
-                               placeholder="gatekeeper@company.com">
-                    </div>
-                    <div class="form-group">
-                        <label>From Name</label>
-                        <input type="text" name="smtp_from_name" value="{smtp_from_name}"
-                               placeholder="GateKeeper">
-                    </div>
-                </div>
-                <div style="margin-top:0.5rem;display:flex;gap:0.5rem;">
-                    <button type="submit" class="btn btn-primary">Save Email Settings</button>
-                    <button type="button" class="btn btn-ghost"
-                            hx-post="/admin/settings/smtp/test" hx-target="#smtp-result"
-                            hx-include="closest form">Send Test Email</button>
-                </div>
-            </form>
-            <div style="margin-top:1rem;padding:0.75rem;background:var(--bg);border-radius:6px;font-size:0.8rem;color:var(--text-dim);">
-                <strong>Emails sent at:</strong> Pre-registration (to host, visitor, receptionist) |
-                Walk-in (to host, receptionist) | Check-in (to host)
-            </div>
-        </div>
-
     "##,
         host_count = host_count,
         visitor_count = visitor_count,
         visit_count = visit_count,
-        graph_badge = graph_badge,
         theme_system = if setting_val("ui_theme").is_empty() || setting_val("ui_theme") == "system" { "selected" } else { "" },
         theme_dark = if setting_val("ui_theme") == "dark" { "selected" } else { "" },
         theme_light = if setting_val("ui_theme") == "light" { "selected" } else { "" },
@@ -2183,8 +2114,6 @@ pub fn admin_page(
         pr_48 = if setting_val("photo_retention_hours") == "48" { "selected" } else { "" },
         pr_72 = if setting_val("photo_retention_hours") == "72" { "selected" } else { "" },
         pr_168 = if setting_val("photo_retention_hours") == "168" { "selected" } else { "" },
-        smtp_from_address = setting_val("smtp_from_address"),
-        smtp_from_name = setting_val("smtp_from_name"),
         badge_primary_color = {
             let c = setting_val("badge_primary_color");
             if c.is_empty() { "#1a56db".to_string() } else { c }

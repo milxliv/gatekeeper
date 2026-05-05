@@ -1,7 +1,4 @@
 mod db;
-mod email;
-mod graph;
-mod graph_service;
 mod models;
 mod rate_limit;
 mod redirect;
@@ -28,7 +25,6 @@ async fn serve_htmx() -> impl IntoResponse {
 
 pub struct AppState {
     pub db: db::DbPool,
-    pub graph: Option<Arc<graph_service::GraphService>>,
     pub photos_dir: std::path::PathBuf,
     pub password_hash: Option<String>,
     pub admin_password_hash: Option<String>,
@@ -181,19 +177,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let graph = match graph_service::GraphService::from_env() {
-        Ok(svc) => {
-            tracing::info!("Graph calendar integration enabled");
-            Some(Arc::new(svc))
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Graph calendar disabled (set GRAPH_* env vars to enable): {e}"
-            );
-            None
-        }
-    };
-
     let photos_dir = std::path::PathBuf::from(
         std::env::var("GATEKEEPER_PHOTOS")
             .unwrap_or_else(|_| "photos".to_string()),
@@ -215,7 +198,6 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState {
         db: pool,
-        graph,
         photos_dir,
         password_hash,
         admin_password_hash,
@@ -382,14 +364,6 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/admin/settings",
             post(routes::api_save_general_settings),
-        )
-        .route(
-            "/admin/settings/smtp",
-            post(routes::api_save_smtp_settings),
-        )
-        .route(
-            "/admin/settings/smtp/test",
-            post(routes::api_test_smtp),
         )
         .route(
             "/admin/settings/theme",

@@ -17,8 +17,6 @@ uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Graph API integration (O365 calendar)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 dotenvy = "0.15"
 anyhow = "1"
 sha2 = "0.10"
@@ -29,7 +27,7 @@ totp-rs = { version = "5", features = ["qr", "gen_secret"] }
 
 # Native TLS for browser ↔ server (auto self-signed on first run)
 axum-server = { version = "0.7", features = ["tls-rustls"] }
-rustls = "0.23"
+rustls = { version = "0.23", features = ["ring"] }
 rcgen = "0.13"
 gethostname = "0.5"
 

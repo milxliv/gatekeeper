@@ -11,10 +11,8 @@ use axum::{
 
 const LOGIN_MAX_ATTEMPTS: usize = 10;
 const LOGIN_WINDOW: Duration = Duration::from_secs(900); // 15 min
-use chrono::TimeZone;
 use serde::{Deserialize, Serialize};
 use crate::db;
-use crate::graph_service::VisitRecord;
 use crate::models::*;
 use crate::templates;
 use crate::AppState;
@@ -153,8 +151,7 @@ pub async fn page_dashboard(
     apply_role(&role);
     let visits = db::list_visits_today(&state.db).unwrap_or_default();
     let upcoming = db::list_preregistered_upcoming(&state.db).unwrap_or_default();
-    let graph_connected = state.graph.is_some();
-    Html(templates::dashboard_page(&visits, &upcoming, graph_connected))
+    Html(templates::dashboard_page(&visits, &upcoming))
 }
 
 pub async fn page_pre_register(
@@ -273,89 +270,11 @@ pub async fn api_pre_register(
     };
 
     match db::create_visit(&state.db, &visit) {
-        Ok(visit_id) => {
+        Ok(_visit_id) => {
             let host = db::get_host(&state.db, &visit.host_id).ok().flatten();
             let host_name = host.as_ref()
                 .map(|h| h.name.clone())
                 .unwrap_or_else(|| "the host".to_string());
-
-            // Schedule calendar event if Graph is enabled
-            if let (Some(ref graph), Some(ref host)) = (&state.graph, &host) {
-                let expected = visit.expected_date.clone()
-                    .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
-
-                // Parse time from form (default 9:00 AM)
-                let time_str = expected_time_str.as_deref().unwrap_or("09:00");
-                let (start_h, start_m) = {
-                    let parts: Vec<&str> = time_str.split(':').collect();
-                    (
-                        parts.first().and_then(|p| p.parse::<u32>().ok()).unwrap_or(9),
-                        parts.get(1).and_then(|p| p.parse::<u32>().ok()).unwrap_or(0),
-                    )
-                };
-                let duration_mins: i64 = form.duration.as_deref()
-                    .and_then(|d| d.parse().ok())
-                    .unwrap_or(60);
-
-                let start = chrono::NaiveDate::parse_from_str(&expected, "%Y-%m-%d")
-                    .ok()
-                    .and_then(|d| d.and_hms_opt(start_h, start_m, 0))
-                    .map(|dt| {
-                        chrono::Local::now()
-                            .timezone()
-                            .from_local_datetime(&dt)
-                            .single()
-                    })
-                    .flatten()
-                    .unwrap_or_else(chrono::Local::now);
-
-                let end = start + chrono::Duration::minutes(duration_mins);
-
-                let record = VisitRecord {
-                    visit_id: visit_id.clone(),
-                    visitor_name: visitor.name.clone(),
-                    visitor_email: visitor.email.clone(),
-                    host_email: host.email.clone(),
-                    host_name: Some(host.name.clone()),
-                    start,
-                    end,
-                    location: visit.areas_requested.clone()
-                        .unwrap_or_else(|| "Main Lobby".to_string()),
-                    reason: visit.purpose.clone(),
-                    reminder_minutes: Some(15),
-                };
-
-                let graph = Arc::clone(graph);
-                let db = state.db.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = graph.schedule_visit(&db, &record).await {
-                        tracing::error!(
-                            visit_id = %record.visit_id,
-                            "Graph calendar scheduling failed: {e:#}"
-                        );
-                    }
-                });
-            }
-
-            // Send email notifications in background
-            {
-                let db = state.db.clone();
-                let visitor_email = visitor.email.clone();
-                // Build a VisitDetail for the email templates
-                if let Ok(visits) = db::list_visits_today(&db) {
-                    if let Some(detail) = visits.iter().find(|v| v.id == visit_id) {
-                        let detail = detail.clone();
-                        let db2 = db.clone();
-                        tokio::spawn(async move {
-                            crate::email::send_preregistration_emails(
-                                &db2,
-                                &detail,
-                                visitor_email.as_deref(),
-                            ).await;
-                        });
-                    }
-                }
-            }
 
             Html(templates::alert_success(&format!(
                 "Pre-registered. {} will be notified when they arrive.",
@@ -436,22 +355,8 @@ pub async fn api_walk_in(
                 host_phone
             );
 
-            // Send email notifications in background
-            {
-                let db = state.db.clone();
-                if let Ok(visits) = db::list_visits_today(&db) {
-                    if let Some(detail) = visits.iter().find(|v| v.id == _id) {
-                        let detail = detail.clone();
-                        let db2 = db.clone();
-                        tokio::spawn(async move {
-                            crate::email::send_walkin_emails(&db2, &detail).await;
-                        });
-                    }
-                }
-            }
-
             Html(templates::alert_success(&format!(
-                "Walk-in logged. Notification sent to {} ({}). \
+                "Walk-in logged. Please notify {} ({}). \
                  Visitor should wait for approval.",
                 host_name, host_email
             )))
@@ -606,24 +511,12 @@ pub async fn api_approve_visit(
     Html("<tr><td colspan='9'>Updated</td></tr>".to_string())
 }
 
-/// Deny a visit — also cancels any Graph calendar event
+/// Deny a visit
 pub async fn api_deny_visit(
     State(state): State<Arc<AppState>>,
     Path(visit_id): Path<String>,
 ) -> Html<String> {
     let _ = db::update_visit_status(&state.db, &visit_id, "denied");
-
-    // Cancel calendar event in background if Graph is enabled
-    if let Some(ref graph) = state.graph {
-        let graph = Arc::clone(graph);
-        let db = state.db.clone();
-        let vid = visit_id.clone();
-        tokio::spawn(async move {
-            if let Err(e) = graph.cancel_visit(&db, &vid).await {
-                tracing::error!(visit_id = %vid, "Graph cancel failed: {e:#}");
-            }
-        });
-    }
 
     if let Ok(visits) = db::list_visits_today(&state.db) {
         if let Some(v) = visits.iter().find(|v| v.id == visit_id) {
@@ -695,58 +588,6 @@ pub async fn api_checkin_visit(
     let badge_num = db::next_badge_number(&state.db);
     let _ = db::check_in_visit(&state.db, &visit_id, Some(&badge_num));
 
-    // Schedule calendar event in background if Graph is enabled
-    if let Some(ref graph) = state.graph {
-        let visit_detail = db::list_visits_today(&state.db)
-            .ok()
-            .and_then(|visits| {
-                visits.into_iter().find(|v| v.id == visit_id)
-            });
-
-        if let Some(detail) = visit_detail {
-            let now = chrono::Local::now();
-            let record = VisitRecord {
-                visit_id: detail.id.clone(),
-                visitor_name: detail.visitor.name.clone(),
-                visitor_email: None,
-                host_email: detail.host.email.clone(),
-                host_name: Some(detail.host.name.clone()),
-                start: now,
-                end: now + chrono::Duration::hours(1),
-                location: detail
-                    .areas_requested
-                    .clone()
-                    .unwrap_or_else(|| "Main Lobby".to_string()),
-                reason: detail.purpose.clone(),
-                reminder_minutes: Some(15),
-            };
-
-            let graph = Arc::clone(graph);
-            let db = state.db.clone();
-            tokio::spawn(async move {
-                if let Err(e) = graph.schedule_visit(&db, &record).await {
-                    tracing::error!(
-                        visit_id = %record.visit_id,
-                        "Graph calendar scheduling failed: {e:#}"
-                    );
-                }
-            });
-        }
-    }
-
-    // Send check-in email to host in background
-    {
-        let db = state.db.clone();
-        let vid = visit_id.clone();
-        tokio::spawn(async move {
-            if let Ok(visits) = db::list_visits_today(&db) {
-                if let Some(detail) = visits.iter().find(|v| v.id == vid) {
-                    crate::email::send_checkin_emails(&db, detail).await;
-                }
-            }
-        });
-    }
-
     if let Ok(visits) = db::list_visits_today(&state.db) {
         if let Some(v) = visits.iter().find(|v| v.id == visit_id) {
             return Html(templates::visit_row_partial(v));
@@ -805,16 +646,13 @@ pub struct KioskCheckInRequest {
     pub visitor_email: Option<String>,
     pub visitor_company: Option<String>,
     pub host_id: String,
-    pub duration_minutes: Option<i64>,
     pub location: Option<String>,
     pub reason: String,
-    pub reminder_minutes: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct KioskCheckInResponse {
     pub visit_id: String,
-    pub calendar_scheduled: bool,
     pub message: String,
 }
 
@@ -880,40 +718,6 @@ pub async fn api_kiosk_checkin(
     let visit_id = db::create_visit(&state.db, &visit)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Schedule calendar event in background if Graph is enabled
-    let mut calendar_scheduled = false;
-    if let Some(ref graph) = state.graph {
-        let now = chrono::Local::now();
-        let duration = req.duration_minutes.unwrap_or(60);
-        let end = now + chrono::Duration::minutes(duration);
-
-        let record = VisitRecord {
-            visit_id: visit_id.clone(),
-            visitor_name: visitor.name.clone(),
-            visitor_email: req.visitor_email.clone(),
-            host_email: host.email.clone(),
-            host_name: Some(host.name.clone()),
-            start: now,
-            end,
-            location,
-            reason: req.reason.clone(),
-            reminder_minutes: req.reminder_minutes,
-        };
-
-        let graph = Arc::clone(graph);
-        let db = state.db.clone();
-        tokio::spawn(async move {
-            if let Err(e) = graph.schedule_visit(&db, &record).await {
-                tracing::error!(
-                    visit_id = %record.visit_id,
-                    "Kiosk Graph calendar scheduling failed: {e:#}"
-                );
-            }
-        });
-
-        calendar_scheduled = true;
-    }
-
     tracing::info!(
         "KIOSK CHECK-IN: {} here to see {} — {}",
         visitor.name, host.name, req.reason
@@ -921,7 +725,6 @@ pub async fn api_kiosk_checkin(
 
     Ok(Json(KioskCheckInResponse {
         visit_id,
-        calendar_scheduled,
         message: format!("Welcome, {}! {} has been notified.", visitor.name, host.name),
     }))
 }
@@ -937,8 +740,7 @@ pub async fn page_admin(
     let settings = db::get_all_settings(&state.db);
     let hosts = db::list_hosts(&state.db).unwrap_or_default();
     let stats = db::get_db_stats(&state.db);
-    let graph_status = if state.graph.is_some() { "connected" } else { "disabled" };
-    Html(templates::admin_page(&settings, &hosts, stats, graph_status))
+    Html(templates::admin_page(&settings, &hosts, stats))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1225,62 +1027,6 @@ pub async fn page_badge_preview(
     };
 
     Html(templates::badge_page_preview(&sample, None, &bs.as_opts()))
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SmtpSettingsForm {
-    pub smtp_from_address: String,
-    pub smtp_from_name: String,
-}
-
-pub async fn api_save_smtp_settings(
-    State(state): State<Arc<AppState>>,
-    Form(form): Form<SmtpSettingsForm>,
-) -> Html<String> {
-    let pairs = [
-        ("smtp_from_address", form.smtp_from_address.as_str()),
-        ("smtp_from_name", form.smtp_from_name.as_str()),
-    ];
-    for (key, val) in &pairs {
-        if let Err(e) = db::set_setting(&state.db, key, val) {
-            return Html(templates::alert_error(&safe_error("Failed to save settings", e)));
-        }
-    }
-    Html(templates::alert_success("Email settings saved."))
-}
-
-pub async fn api_test_smtp(
-    State(state): State<Arc<AppState>>,
-    Form(form): Form<SmtpSettingsForm>,
-) -> Html<String> {
-    // Save settings first
-    let pairs = [
-        ("smtp_from_address", form.smtp_from_address.as_str()),
-        ("smtp_from_name", form.smtp_from_name.as_str()),
-    ];
-    for (key, val) in &pairs {
-        let _ = db::set_setting(&state.db, key, val);
-    }
-
-    let to = if form.smtp_from_address.is_empty() {
-        return Html(templates::alert_error("Set a From Address first."));
-    } else {
-        form.smtp_from_address.clone()
-    };
-
-    match crate::email::send_test_email(&state.db, &to).await {
-        Ok(_) => Html(templates::alert_success(&format!(
-            "Test email sent to {} via Microsoft Graph. Check your inbox.",
-            to
-        ))),
-        Err(e) => {
-            tracing::error!("SMTP test failed: {}", e);
-            Html(templates::alert_error(
-                "Send failed. Make sure Graph API credentials are configured \
-                 in the Calendar section above, with Mail.Send permission."
-            ))
-        },
-    }
 }
 
 // ── Badge printing ────────────────────────────────────────────
